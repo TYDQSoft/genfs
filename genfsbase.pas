@@ -117,6 +117,7 @@ procedure genfs_filesystem_add(var fs:genfs_filesystem;srcpath:UnicodeString;des
 procedure genfs_filesystem_delete(var fs:genfs_filesystem;delpath:UnicodeString);
 procedure genfs_filesystem_extract(fs:genfs_filesystem;srcpath:UnicodeString;destpath:UnicodeString);
 procedure genfs_filesystem_free(var fs:genfs_filesystem);
+function genfs_is_mask(detectstr:UnicodeString):boolean;
 
 implementation
 
@@ -1520,7 +1521,7 @@ begin
        SetLength(Result.path,Result.count);
        Result.path[Result.count-1]:=Copy(tempstr,1,i-1);
       end;
-     Delete(tempstr,1,i); i:=1;
+     Delete(tempstr,1,i); i:=1; continue;
     end;
    inc(i);
   end;
@@ -1868,14 +1869,9 @@ var extlist:genfs_path;
     copycontent:array[1..512] of byte;
 begin
  bool:=genfs_is_mask(srcpath);
- if(bool=true) then
+ if(bool) then
   begin
-   len:=length(srcpath); i:=1;
-   while(i<=len)do
-    begin
-     if(srcpath[i]='*') or (srcpath[i]='?') then break;
-     inc(i);
-    end;
+   len:=length(srcpath); i:=len;
    while(i>0)do
     begin
      if(srcpath[i]='/') or (srcpath[i]='\') then break;
@@ -1885,9 +1881,16 @@ begin
   end
  else
   begin
-   rootpath:=srcpath; rootlen:=length(srcpath);
+   if(FileExists(srcpath)) then
+    begin
+     rootpath:=srcpath; rootlen:=length(srcpath);
+    end
+   else
+    begin
+     rootpath:=genfs_extract_filepath(srcpath)+'/'; rootlen:=length(rootpath);
+    end;
   end;
- extlist:=genfs_search_for_path_external(srcpath,genfs_is_mask(srcpath));
+ extlist:=genfs_search_for_path_external(srcpath,bool);
  inlist:=genfs_search_for_path(fs,'/'); i:=1;
  if(fs.fsname=filesystem_fat12) or (fs.fsname=filesystem_fat16) or
  (fs.fsname=filesystem_fat32) then
@@ -2016,7 +2019,7 @@ begin
      temppath:=Copy(extlist.FilePath[i-1],rootlen+1,length(extlist.Filepath[i-1])-rootlen);
      if(destpath='/') or (destpath='\') then detectpath:=destpath+temppath
      else detectpath:=destpath+'/'+temppath;
-     path:=genfs_path_to_path_string(destpath);
+     path:=genfs_path_to_path_string(detectpath);
      temppath2:='/'; j:=1;
      while(j<=path.count) do
       begin
@@ -2052,7 +2055,7 @@ begin
        k:=1; b:=1; if(j>1) then temphavedot:=false else temphavedot:=true;
        while(k<=inlist.count) do
         begin
-         if(genfs_check_prefix(temppath2,inlist.FilePath[k-1],true)) then
+         if(genfs_check_prefix(temppath2,inlist.FilePath[k-1],true))then
           begin
            if(inlist.FileFree[k-1]) and (EraseDir=false) then
             begin

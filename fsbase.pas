@@ -222,6 +222,7 @@ function fat_FatStringToFatDirectory(const Source:fat_string;FileAttr:byte;
 date:fat_date;time:fat_time;FileSize:SizeUint;ClusterPos:dword):fat_directory;
 function fat_is_file(attr:byte):byte;
 function fat_calculate_directory_size(const str:PWideChar):SizeUint;
+function fat_PWideCharIsLongFileName(const str:PWideChar):boolean;
 
 implementation
 
@@ -388,16 +389,16 @@ begin
      if((str+len)^='.') then extpos:=len+1;
      inc(len);
     end;
-   while(i<=len div 11+1)do
+   while(i<=len div 13+1)do
     begin
      inc(Result.unicodefncount);
      ReallocMem(Result.unicodefn,Result.unicodefncount*sizeof(fat_long_directory_structure));
      j:=1;
      while(j<=5)do
       begin
-       if((i-1)*11+j<=len) then
-       (Result.unicodefn+Result.unicodefncount-1)^.fn1[j]:=(str+(i-1)*11+j-1)^
-       else if((i-1)*11+j=len+1) then
+       if((i-1)*13+j<=len) then
+       (Result.unicodefn+Result.unicodefncount-1)^.fn1[j]:=(str+(i-1)*13+j-1)^
+       else if((i-1)*13+j=len+1) then
        (Result.unicodefn+Result.unicodefncount-1)^.fn1[j]:=#0
        else
        (Result.unicodefn+Result.unicodefncount-1)^.fn1[j]:=#$FFFF;
@@ -406,9 +407,9 @@ begin
      j:=6;
      while(j<=11)do
       begin
-       if((i-1)*11+j<=len) then
-       (Result.unicodefn+Result.unicodefncount-1)^.fn2[j-5]:=(str+(i-1)*11+j-1)^
-       else if((i-1)*11+j=len+1) then
+       if((i-1)*13+j<=len) then
+       (Result.unicodefn+Result.unicodefncount-1)^.fn2[j-5]:=(str+(i-1)*13+j-1)^
+       else if((i-1)*13+j=len+1) then
        (Result.unicodefn+Result.unicodefncount-1)^.fn2[j-5]:=#0
        else
        (Result.unicodefn+Result.unicodefncount-1)^.fn2[j-5]:=#$FFFF;
@@ -417,9 +418,9 @@ begin
      j:=12;
      while(j<=13)do
       begin
-       if((i-1)*11+j<=len) then
-       (Result.unicodefn+Result.unicodefncount-1)^.fn3[j-11]:=(str+(i-1)*11+j-1)^
-       else if((i-1)*11+j=len+1) then
+       if((i-1)*13+j<=len) then
+       (Result.unicodefn+Result.unicodefncount-1)^.fn3[j-11]:=(str+(i-1)*13+j-1)^
+       else if((i-1)*13+j=len+1) then
        (Result.unicodefn+Result.unicodefncount-1)^.fn3[j-11]:=#0
        else
        (Result.unicodefn+Result.unicodefncount-1)^.fn3[j-11]:=#$FFFF;
@@ -440,6 +441,11 @@ begin
       begin
        inc(i);
       end
+     else if((str+i-1)^>='a') and ((str+i-1)^<='z') then
+      begin
+       Result.ansifn[j]:=Char(Byte('A')+Byte((str+i-1)^)-Byte('a'));
+       inc(i); inc(j);
+      end
      else
       begin
        Result.ansifn[j]:=Char((str+i-1)^);
@@ -453,16 +459,21 @@ begin
      if((str+i-1)^>#127) then
       begin
        Result.ansiext[j]:='_';
-       inc(i); inc(j);
+       inc(i); inc(j); continue;
       end
      else if((str+i-1)^<=' ') then
       begin
-       inc(i);
+       inc(i); continue;
+      end
+     else if((str+i-1)^>='a') and ((str+i-1)^<='z') then
+      begin
+       Result.ansiext[j]:=Char(Byte('A')+Byte((str+i-1)^)-Byte('a'));
+       inc(i); inc(j); continue;
       end
      else
       begin
        Result.ansiext[j]:=Char((str+i-1)^);
-       inc(i); inc(j);
+       inc(i); inc(j); continue;
       end;
      inc(j);
     end;
@@ -484,7 +495,7 @@ begin
       begin
        if((str+i-1)^='.') then
         begin
-         inc(i); j:=i; tempbool:=true; continue;
+         j:=i; inc(i); tempbool:=true; continue;
         end
        else if((str+i-1)^>='a') and ((str+i-1)^<='z') and (tempbool) then
         begin
@@ -548,7 +559,10 @@ begin
        (Result+len-1)^:=(str.unicodefn+i-1)^.fn1[j];
        inc(j);
       end;
-     if(j<=5) then break;
+     if(j<=5) then
+      begin
+       dec(i); continue;
+      end;
      j:=1;
      while(j<=6)do
       begin
@@ -558,8 +572,11 @@ begin
        (Result+len-1)^:=(str.unicodefn+i-1)^.fn2[j];
        inc(j);
       end;
+     if(j<=6) then
+      begin
+       dec(i); continue;
+      end;
      j:=1;
-     if(j<=6) then break;
      while(j<=2)do
       begin
        if((str.unicodefn+i-1)^.fn3[j]=#0) then break;
@@ -568,7 +585,10 @@ begin
        (Result+len-1)^:=(str.unicodefn+i-1)^.fn3[j];
        inc(j);
       end;
-     if(j<=2) then break;
+     if(j<=2) then
+      begin
+       dec(i); continue;
+      end;
      dec(i);
     end;
    (Result+len)^:=#0;
@@ -615,9 +635,9 @@ procedure fat_MoveLongDirStructStringToFatString(const source:fat_long_directory
 var dest:fat_string;index:SizeUint);
 begin
  if(index>Dest.unicodefncount) then exit;
- Move(source.longdirectoryname1[1],(dest.unicodefn+index-1)^.fn1[1],5);
- Move(source.longdirectoryname2[1],(dest.unicodefn+index-1)^.fn2[1],6);
- Move(source.longdirectoryname3[1],(dest.unicodefn+index-1)^.fn3[1],2);
+ Move(source.longdirectoryname1[1],(dest.unicodefn+index-1)^.fn1[1],10);
+ Move(source.longdirectoryname2[1],(dest.unicodefn+index-1)^.fn2[1],12);
+ Move(source.longdirectoryname3[1],(dest.unicodefn+index-1)^.fn3[1],14);
 end;
 procedure fat_MovefatStringToDirStruct(const Source:fat_string;
 var Dest:fat_directory_structure);
@@ -629,9 +649,9 @@ procedure fat_MovefatStringToLongDirStruct(const Source:fat_String;const index:S
 var Dest:fat_long_directory_structure);
 begin
  if(index>Source.unicodefncount) then exit;
- Move((Source.unicodefn+index-1)^.fn1[1],Dest.longdirectoryname1[1],5);
- Move((Source.unicodefn+index-1)^.fn2[1],Dest.longdirectoryname2[1],6);
- Move((Source.unicodefn+index-1)^.fn3[1],Dest.longdirectoryname3[1],2);
+ Move((Source.unicodefn+index-1)^.fn1[1],Dest.longdirectoryname1[1],10);
+ Move((Source.unicodefn+index-1)^.fn2[1],Dest.longdirectoryname2[1],12);
+ Move((Source.unicodefn+index-1)^.fn3[1],Dest.longdirectoryname3[1],4);
 end;
 function fat_FatStringToFatDirectory(const Source:fat_string;FileAttr:byte;
 date:fat_date;time:fat_time;FileSize:SizeUint;ClusterPos:dword):fat_directory;
@@ -675,8 +695,11 @@ begin
    fat_MovefatStringToLongDirStruct(Source,i,(res.longdir+res.longdircount-1)^);
    (res.longdir+res.longdircount-1)^.longdirectoryfirstclusterlowword:=0;
    (res.longdir+res.longdircount-1)^.longdirectoryattr:=fat_attribute_long_name;
+   if(i=1) then
    (res.longdir+res.longdircount-1)^.longdirectoryorder:=
-   (Source.unicodefncount-i+1) or fat_attribute_last_long_entry;
+   (Source.unicodefncount-i+1) or fat_attribute_last_long_entry
+   else
+   (res.longdir+res.longdircount-1)^.longdirectoryorder:=$01;
    (res.longdir+res.longdircount-1)^.longdirectorychecksum:=fat_generate_checksum(res.dir);
    (res.longdir+res.longdircount-1)^.longdirectorytype:=0;
    inc(i);
