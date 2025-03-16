@@ -2,6 +2,8 @@ unit genfsbase;
 
 interface
 
+{$MODE OBJFPC}
+
 uses Classes,SysUtils,fsbase;
 
 const genfs_var_byte=0;
@@ -13,7 +15,8 @@ const genfs_var_byte=0;
       genfs_var_integer=6;
       genfs_var_int64=7;
 
-type genfs_variant=packed record
+type Integer=-$7FFFFFFF..$7FFFFFFF;
+     genfs_variant=packed record
                    vartype:byte;
                    case Byte of
                    0:(genfs_byte:byte;);
@@ -113,7 +116,7 @@ operator := (x:Integer)res:genfs_variant;
 operator := (x:Int64)res:genfs_variant;
 function genfs_filesystem_create(fn:UnicodeString;fstype:byte;Size:SizeUint;param:array of genfs_variant):genfs_filesystem;
 function genfs_filesystem_read(fn:UnicodeString):genfs_filesystem;
-procedure genfs_filesystem_add(var fs:genfs_filesystem;srcpath:UnicodeString;destpath:UnicodeString);
+procedure genfs_filesystem_add(var fs:genfs_filesystem;srcpath:UnicodeString;indestpath:UnicodeString);
 procedure genfs_filesystem_delete(var fs:genfs_filesystem;delpath:UnicodeString);
 procedure genfs_filesystem_extract(fs:genfs_filesystem;srcpath:UnicodeString;destpath:UnicodeString);
 procedure genfs_filesystem_free(var fs:genfs_filesystem);
@@ -905,6 +908,28 @@ begin
  while(j>1) and ((path2[j]<>'/') or (path2[j]<>'\')) do dec(j);
  if(Copy(path1,1,i-1)='') and (Copy(path1,1,i-1)=Copy(path2,1,j-1)) then Result:=true else Result:=false;
 end;
+{File System Path Translation}
+function genfs_path_to_path_string(path:Unicodestring):genfs_path_string;
+var i:SizeUint;
+    tempstr:Unicodestring;
+begin
+ i:=1; tempstr:=path;
+ Result.count:=0; SetLength(Result.path,1);
+ while(length(tempstr)>0)do
+  begin
+   if(tempstr[i]='/') or (tempstr[i]='\') then
+    begin
+     if(i>1) then
+      begin
+       inc(Result.count);
+       SetLength(Result.path,Result.count);
+       Result.path[Result.count-1]:=Copy(tempstr,1,i-1);
+      end;
+     Delete(tempstr,1,i); i:=1; continue;
+    end;
+   inc(i);
+  end;
+end;
 {Detect the file and directory in image}
 function genfs_search_for_path(fs:genfs_filesystem;
 basedir:Unicodestring;startoffset:SizeUint=0;Subdir:boolean=true):genfs_inner_path;
@@ -914,6 +939,9 @@ var fatstr:fat_string;
     i,offset,offset2,tempnum,tempnum2,ii1,ii2:SizeUint;
     detectcontent:array[1..32] of Byte;
     bool:boolean;
+    {If the search path is not on Root Directory,pathstr is used}
+    pathstr:genfs_path_string;
+    index:SizeUint;
 begin
  i:=1; Result.Count:=0;
  SetLength(Result.FilePath,0); SetLength(Result.FileClass,0);
@@ -921,9 +949,10 @@ begin
  SetLength(Result.FileDirSize,0); SetLength(Result.FileOffset,0);
  if(fs.fsname=filesystem_fat12) then
   begin
+   offset2:=0;
    if(basedir='/') or (basedir='\') then
     begin
-     offset:=0; offset2:=0; fatstr.unicodefn:=nil; fatstr.unicodefncount:=0; bool:=false;
+     offset:=0; fatstr.unicodefn:=nil; fatstr.unicodefncount:=0; bool:=false;
      while(True)do
       begin
        genfs_io_read(fs,detectcontent,fs.fat12.datastart+offset,sizeof(fat_directory_structure));
@@ -1022,11 +1051,77 @@ begin
     end
    else
     begin
-     offset:=startoffset; offset2:=0; fatstr.unicodefn:=nil; fatstr.unicodefncount:=0; bool:=false;
+     if(startoffset=0) then
+      begin
+       offset:=0; index:=1;
+       pathstr:=genfs_path_to_path_string(basedir);
+       fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+       while(index<=pathstr.count)do
+        begin
+         genfs_io_read(fs,detectcontent,fs.fat12.datastart+offset,sizeof(fat_directory_structure));
+         if(detectcontent[1]=$00) and (bool=false) then
+          begin
+           if(fatstr.unicodefn<>nil) then
+            begin
+             FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+            end;
+           break;
+          end
+         else if(detectcontent[12]<>fat_attribute_long_name) and (detectcontent[1]<>$E5) then
+          begin
+           fat_MoveDirStructStringToFatString(Pfat_directory_structure(@detectcontent)^,fatstr);
+           tempstr:=fat_FatStringToPWideChar(fatstr);
+           if(UnicodeString(tempstr)<>'..') and (UnicodeString(tempstr)<>'.')
+           and(fat_is_file(Pfat_directory_structure(@detectcontent)^.directoryattribute)
+           =fat_directory_directory) and (tempstr=pathstr.path[index-1]) then
+            begin
+             offset:=(Pfat_directory_structure(@detectcontent)^.directoryfirstclusterhighword shl 16
+             +Pfat_directory_structure(@detectcontent)^.directoryfirstclusterlowword-2)*
+             fs.fat12.header.head.bpb_SectorPerCluster*fs.fat12.header.head.bpb_bytesPerSector;
+             inc(index);
+             if(fatstr.unicodefncount>0) then
+              begin
+               FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+              end;
+             FreeMem(tempstr);
+             continue;
+            end;
+           if(fatstr.unicodefncount>0) then
+            begin
+             FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+            end;
+           FreeMem(tempstr);
+          end;
+         inc(offset,sizeof(fat_directory_structure));
+         tempnum:=offset div (fs.fat12.header.head.bpb_bytesPerSector*
+         fs.fat12.header.head.bpb_SectorPerCluster)+2;
+         tempnum2:=(offset-sizeof(fat_directory_structure)) div (fs.fat12.header.head.bpb_bytesPerSector*
+         fs.fat12.header.head.bpb_SectorPerCluster)+2;
+         if(tempnum>tempnum2) then
+          begin
+           ii1:=tempnum2 shr 1; ii2:=tempnum2 mod 2;
+           if(ii2=0) then
+            begin
+             if(fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry1)<>fat_using) then break
+             else offset:=
+             ((fs.fat12.entrypair+ii1)^.entry12.entry1-2)
+             *fs.fat12.header.head.bpb_bytesPerSector*fs.fat12.header.head.bpb_SectorPerCluster;
+            end
+           else if(ii2=1) then
+            begin
+             if(fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry2)<>fat_using) then break
+             else offset:=
+             ((fs.fat12.entrypair+ii1)^.entry12.entry2-2)
+             *fs.fat12.header.head.bpb_bytesPerSector*fs.fat12.header.head.bpb_SectorPerCluster;
+            end;
+          end;
+        end;
+      end
+     else offset:=startoffset;
+     fatstr.unicodefn:=nil; fatstr.unicodefncount:=0; bool:=false;
      while(True)do
       begin
        genfs_io_read(fs,detectcontent,fs.fat12.datastart+offset,sizeof(fat_directory_structure));
-       if(detectcontent[1]>127) then break;
        if(detectcontent[1]=$00) and (bool=false) then
         begin
          if(fatstr.unicodefn<>nil) then
@@ -1066,7 +1161,7 @@ begin
          Result.FileDirSize[Result.count-1]:=sizeof(fat_directory_structure);
          if(Result.FileClass[Result.count-1]=fat_directory_directory)
          and (Pfat_directory_structure(@detectcontent)^.directoryfilesize=0)
-         and (UnicodeString(tempstr)<>'..') and (UnicodeString(tempstr)<>'.') and (subdir) then
+         and (UnicodeString(tempstr)<>'..') and (UnicodeString(tempstr)<>'.') then
           begin
            temppath:=genfs_search_for_path(fs,basedir+'/'+tempstr,
            (Pfat_directory_structure(@detectcontent)^.directoryfirstclusterhighword shl 16+
@@ -1123,9 +1218,10 @@ begin
   end
  else if(fs.fsname=filesystem_fat16) then
   begin
+   offset2:=0;
    if(basedir='/') or (basedir='\') then
     begin
-     offset:=0; offset2:=0; fatstr.unicodefn:=nil; fatstr.unicodefncount:=0; bool:=false;
+     offset:=0; fatstr.unicodefn:=nil; fatstr.unicodefncount:=0; bool:=false;
      while(True)do
       begin
        genfs_io_read(fs,detectcontent,fs.fat16.datastart+offset,sizeof(fat_directory_structure));
@@ -1206,7 +1302,65 @@ begin
     end
    else
     begin
-     offset:=startoffset; offset2:=0; fatstr.unicodefn:=nil; fatstr.unicodefncount:=0; bool:=false;
+     if(startoffset=0) then
+      begin
+       offset:=0; index:=1;
+       pathstr:=genfs_path_to_path_string(basedir); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+       while(index<=pathstr.count)do
+        begin
+         genfs_io_read(fs,detectcontent,fs.fat16.datastart+offset,sizeof(fat_directory_structure));
+         if(detectcontent[1]=$00) and (bool=false) then
+          begin
+           if(fatstr.unicodefn<>nil) then
+            begin
+             FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+            end;
+           break;
+          end
+         else
+          begin
+           fat_MoveDirStructStringToFatString(Pfat_directory_structure(@detectcontent)^,fatstr);
+           tempstr:=fat_FatStringToPWideChar(fatstr);
+           if(UnicodeString(tempstr)<>'..') and (UnicodeString(tempstr)<>'.')
+           and(fat_is_file(Pfat_directory_structure(@detectcontent)^.directoryattribute)
+           =fat_directory_directory) and (tempstr=pathstr.path[index-1]) then
+            begin
+             offset:=(Pfat_directory_structure(@detectcontent)^.directoryfirstclusterhighword shl 16
+             +Pfat_directory_structure(@detectcontent)^.directoryfirstclusterlowword-2)*
+             fs.fat16.header.head.bpb_SectorPerCluster*fs.fat16.header.head.bpb_bytesPerSector;
+             inc(index);
+             if(fatstr.unicodefncount>0) then
+              begin
+               FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+              end;
+             FreeMem(tempstr);
+             continue;
+            end;
+           if(fatstr.unicodefncount>0) then
+            begin
+             FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+            end;
+           FreeMem(tempstr);
+          end;
+         inc(offset,sizeof(fat_directory_structure));
+         tempnum:=offset div (fs.fat16.header.head.bpb_bytesPerSector*
+         fs.fat16.header.head.bpb_SectorPerCluster)+2;
+         tempnum2:=(offset-sizeof(fat_directory_structure)) div (fs.fat16.header.head.bpb_bytesPerSector*
+         fs.fat16.header.head.bpb_SectorPerCluster)+2;
+         if(tempnum>tempnum2) then
+          begin
+           if(tempnum>tempnum2) then
+            begin
+             ii1:=tempnum2 shr 1; ii2:=tempnum mod 2;
+             if(fat16_check_cluster_status((fs.fat16.entrypair+ii1)^.entry16[ii2+1])<>fat_using) then break
+             else offset:=((fs.fat16.entrypair+ii1)^.entry16[ii2+1]-2)
+             *fs.fat16.header.head.bpb_bytesPerSector*fs.fat16.header.head.bpb_SectorPerCluster;
+            end;
+          end;
+        end;
+      end
+     else offset:=startoffset;
+     fatstr.unicodefn:=nil; fatstr.unicodefncount:=0; bool:=false;
      while(True)do
       begin
        tempnum:=offset div (fs.fat16.header.head.bpb_bytesPerSector*
@@ -1309,7 +1463,7 @@ begin
           end;
          break;
         end
-       else if(detectcontent[12]=fat_attribute_long_name) then
+       else if(detectcontent[12]=fat_attribute_long_name) and (detectcontent[1]<>$E5) then
         begin
          inc(fatstr.unicodefncount);
          ReallocMem(fatstr.unicodefn,sizeof(fat_long_directory_structure)*fatstr.unicodefncount);
@@ -1398,7 +1552,74 @@ begin
     end
    else
     begin
-     offset:=startoffset; offset2:=0; fatstr.unicodefn:=nil; fatstr.unicodefncount:=0; bool:=false;
+     if(startoffset=fs.fat32.header.head.bpb_bytesPerSector*
+     fs.fat32.header.head.bpb_SectorPerCluster*(fs.fat32.header.exthead.bpb_rootcluster-2)) then
+      begin
+       offset:=fs.fat32.header.head.bpb_bytesPerSector*
+       fs.fat32.header.head.bpb_SectorPerCluster*(fs.fat32.header.exthead.bpb_rootcluster-2); index:=1;
+       pathstr:=genfs_path_to_path_string(basedir);
+       fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+       while(index<=pathstr.count)do
+        begin
+         genfs_io_read(fs,detectcontent,fs.fat32.datastart+offset,sizeof(fat_directory_structure));
+         if(detectcontent[1]=$00) and (bool=false) then
+          begin
+           if(fatstr.unicodefn<>nil) then
+            begin
+             FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+            end;
+           break;
+          end
+         else if(detectcontent[12]=fat_attribute_long_name) and (detectcontent[1]<>$E5) then
+          begin
+           inc(fatstr.unicodefncount);
+           ReallocMem(fatstr.unicodefn,sizeof(fat_long_directory_structure)*fatstr.unicodefncount);
+           fat_MoveLongDirStructStringToFatString(Pfat_long_directory_structure(@detectcontent)^,
+           fatstr,fatstr.unicodefncount);
+           if(bool=false) then offset2:=offset;
+           bool:=true;
+          end
+         else if(detectcontent[12]<>fat_attribute_long_name) then
+          begin
+           fat_MoveDirStructStringToFatString(Pfat_directory_structure(@detectcontent)^,fatstr);
+           tempstr:=fat_FatStringToPWideChar(fatstr);
+           if(fat_is_file(Pfat_directory_structure(@detectcontent)^.directoryattribute)=
+           fat_directory_directory)
+           and (UnicodeString(tempstr)<>'..') and (UnicodeString(tempstr)<>'.') then
+            begin
+             offset:=(Pfat_directory_structure(@detectcontent)^.directoryfirstclusterhighword shl 16
+             +Pfat_directory_structure(@detectcontent)^.directoryfirstclusterlowword-2)*
+             fs.fat32.header.head.bpb_SectorPerCluster*fs.fat32.header.head.bpb_bytesPerSector;
+             inc(index);
+             if(fatstr.unicodefncount>0) then
+              begin
+               FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+              end;
+             FreeMem(tempstr);
+             continue;
+            end;
+           if(fatstr.unicodefncount>0) then
+            begin
+             FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+            end;
+           FreeMem(tempstr);
+          end;
+         inc(offset,sizeof(fat_directory_structure));
+         tempnum:=offset div (fs.fat32.header.head.bpb_bytesPerSector*
+         fs.fat32.header.head.bpb_SectorPerCluster)+2;
+         tempnum2:=(offset-sizeof(fat_directory_structure)) div (fs.fat32.header.head.bpb_bytesPerSector*
+         fs.fat32.header.head.bpb_SectorPerCluster)+2;
+         if(tempnum>tempnum2) then
+          begin
+           ii1:=tempnum2 shr 1; ii2:=tempnum mod 2;
+           if(fat32_check_cluster_status((fs.fat32.entrypair+ii1)^.entry32[ii2+1])<>fat_using) then break
+           else offset:=((fs.fat32.entrypair+ii1)^.entry32[ii2+1]-2)
+           *fs.fat32.header.head.bpb_bytesPerSector*fs.fat32.header.head.bpb_SectorPerCluster;
+          end;
+        end;
+      end
+     else offset:=startoffset;
+     offset2:=0; fatstr.unicodefn:=nil; fatstr.unicodefncount:=0; bool:=false;
      while(True)do
       begin
        genfs_io_read(fs,detectcontent,fs.fat32.datastart+offset,sizeof(fat_directory_structure));
@@ -1410,7 +1631,7 @@ begin
           end;
          break;
         end
-       else if(detectcontent[12]=fat_attribute_long_name) then
+       else if(detectcontent[12]=fat_attribute_long_name) and (detectcontent[1]<>$E5) then
         begin
          inc(fatstr.unicodefncount);
          ReallocMem(fatstr.unicodefn,sizeof(fat_long_directory_structure)*fatstr.unicodefncount);
@@ -1502,28 +1723,6 @@ begin
  else
   begin
 
-  end;
-end;
-{File System Path Translation}
-function genfs_path_to_path_string(path:Unicodestring):genfs_path_string;
-var i:SizeUint;
-    tempstr:Unicodestring;
-begin
- i:=1; tempstr:=path;
- Result.count:=0; SetLength(Result.path,1);
- while(length(tempstr)>0)do
-  begin
-   if(tempstr[i]='/') or (tempstr[i]='\') then
-    begin
-     if(i>1) then
-      begin
-       inc(Result.count);
-       SetLength(Result.path,Result.count);
-       Result.path[Result.count-1]:=Copy(tempstr,1,i-1);
-      end;
-     Delete(tempstr,1,i); i:=1; continue;
-    end;
-   inc(i);
   end;
 end;
 {FAT File System next number of clusters}
@@ -1713,7 +1912,7 @@ begin
  Result:=Copy(str,1,i-1);
 end;
 {FAT File System edit item name}
-procedure genfs_filesystem_reset_name(var fs:genfs_filesystem);
+procedure genfs_filesystem_reset_name(var fs:genfs_filesystem;basedir:UnicodeString);
 var i,j,k,len:SizeUint;
     inlist:genfs_inner_path;
     filename:UnicodeString;
@@ -1722,7 +1921,7 @@ begin
  if(fs.fsname<>filesystem_fat12) and (fs.fsname<>filesystem_fat16)
  and (fs.fsname<>filesystem_fat32) then exit;
  i:=1;
- inlist:=genfs_search_for_path(fs,'/');
+ inlist:=genfs_search_for_path(fs,basedir);
  while(i<=inlist.Count)do
   begin
    j:=1;
@@ -1838,8 +2037,17 @@ begin
    inc(i);
   end;
 end;
+{File System Path Combiner}
+function genfs_filesystem_combine_path(path1,path2:UnicodeString):UnicodeString;
+var len1,len2:SizeUint;
+begin
+ len1:=length(path1); len2:=length(path2);
+ if(len1>=1) and ((path1[len1]='/') or (path1[len1]='\')) then Result:=path1+path2
+ else if(len2>=1) and ((path2[1]='/') or (path2[1]='\')) then Result:=path1+path2
+ else Result:=path1+'/'+path2;
+end;
 {File System Add item}
-procedure genfs_filesystem_add(var fs:genfs_filesystem;srcpath:UnicodeString;destpath:UnicodeString);
+procedure genfs_filesystem_add(var fs:genfs_filesystem;srcpath:UnicodeString;indestpath:UnicodeString);
 var extlist:genfs_path;
     inlist:genfs_inner_path;
     path:genfs_path_string;
@@ -1851,6 +2059,7 @@ var extlist:genfs_path;
     rootlen:SizeUint;
     bool:boolean;
     i,j,k,m,n,a,b,c,len:SizeUint;
+    destpath:UnicodeString;
     {For FAT Only}
     tempPrevPos:SizeUint;
     tempNextCluster:SizeUint;
@@ -1868,6 +2077,12 @@ var extlist:genfs_path;
     tempnum1,tempnum2,tempnum3,tempnum4,tempnum5,ii1,ii2:SizeUint;
     copycontent:array[1..512] of byte;
 begin
+ len:=length(indestpath);
+ if(len>1) and ((indestpath[len]='\') or (indestpath[len]='/')) then
+  begin
+   destpath:=Copy(indestpath,1,len-1);
+  end
+ else destpath:=indestpath;
  bool:=genfs_is_mask(srcpath);
  if(bool) then
   begin
@@ -1881,9 +2096,18 @@ begin
   end
  else
   begin
-   if(FileExists(srcpath)) then
+   len:=length(srcpath);
+   if(FileExists(srcpath)) and ((destpath='\') or (destpath='/')) then
+    begin
+     rootpath:=genfs_extract_filepath(srcpath)+'/'; rootlen:=length(rootpath);
+    end
+   else if(FileExists(srcpath)) then
     begin
      rootpath:=srcpath; rootlen:=length(srcpath);
+    end
+   else if(srcpath[len]='/') or (srcpath[len]='\') then
+    begin
+     rootpath:=Copy(srcpath,1,len-1); rootlen:=length(srcpath)-1;
     end
    else
     begin
@@ -2017,8 +2241,7 @@ begin
    for i:=1 to extlist.count do
     begin
      temppath:=Copy(extlist.FilePath[i-1],rootlen+1,length(extlist.Filepath[i-1])-rootlen);
-     if(destpath='/') or (destpath='\') then detectpath:=destpath+temppath
-     else detectpath:=destpath+'/'+temppath;
+     detectpath:=genfs_filesystem_combine_path(destpath,temppath);
      path:=genfs_path_to_path_string(detectpath);
      temppath2:='/'; j:=1;
      while(j<=path.count) do
@@ -2526,7 +2749,7 @@ begin
       end;
     end;
   end;
- genfs_filesystem_reset_name(fs);
+ genfs_filesystem_reset_name(fs,genfs_extract_filepath(destpath));
  genfs_write(fs);
 end;
 {File System Delete Item}
@@ -2548,7 +2771,7 @@ begin
  while(delpath[i]<>'/') or (delpath[i]<>'\') do dec(i);
  temppath:=Copy(delpath,1,i-1);
  if(temppath='') then temppath:='/';
- inlist:=genfs_search_for_path(fs,'/');
+ inlist:=genfs_search_for_path(fs,temppath);
  if(fs.fsname=filesystem_fat12) then
   begin
    tempnum1:=fs.fat12.header.head.bpb_bytesPerSector;

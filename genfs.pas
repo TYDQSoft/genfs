@@ -2,6 +2,8 @@ program genfs;
 
 uses genfsbase,fsbase,sysutils,classes;
 
+{$MODE OBJFPC}
+
 function StrToInt(str:UnicodeString):SizeInt;
 var i,len:SizeUint;
 begin
@@ -128,6 +130,12 @@ begin
        readln;
        abort;
       end;
+     if(FileExists(param[2])=false) and (DirectoryExists(param[2])=false) then
+      begin
+       writeln('ERROR:File Path is invaild.');
+       readln;
+       abort;
+      end;
      if(genfs_path_legal(param[3])=false) then
       begin
        writeln('ERROR:Destination Path is illegal.');
@@ -163,7 +171,7 @@ begin
       end;
      if(genfs_path_legal(param[3])=false) then
       begin
-       writeln('ERROR:Destination File Path does not exist.');
+       writeln('ERROR:Destination File Path is invaild.');
        readln;
        abort;
       end;
@@ -182,7 +190,7 @@ begin
       end;
      if(genfs_path_legal(param[3])=false) then
       begin
-       writeln('ERROR:Destination File Path does not exist.');
+       writeln('ERROR:Destination File Path is invaild.');
        readln;
        abort;
       end;
@@ -203,7 +211,7 @@ begin
       end;
      if(genfs_path_legal(param[3])=false) then
       begin
-       writeln('ERROR:Destination File Path does not exist.');
+       writeln('ERROR:Destination File Path is invaild.');
        readln;
        abort;
       end;
