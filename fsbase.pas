@@ -145,6 +145,19 @@ type fat_bpb_header=packed record
                unicodefn:^fat_unicode_fn;
                unicodefncount:SizeUint;
                end;
+    ntfs_pbs_header=packed record
+                    pbs_jumpboot:array[1..3] of byte;
+                    pbs_oemid:array[1..8] of char;
+                    pbs_byteperSector:word;
+                    pbs_sectorPerCluster:byte;
+                    pbs_unused1:array[1..7] of byte;
+                    pbs_drivetype:byte;
+                    pbs_unused2:word;
+                    pbs_sectorsPerTrack:word;
+                    pbs_NumberOfHeads:word;
+                    pbs_hiddenSectors:dword;
+                    pbs_unused3:dword;
+                    end;
 
 const fat_bpb_jumpboot:array[1..3] of byte=($EB,$58,$90);
       fat_bpb_oemname:array[1..8] of char=('f','s','g','e','n',' ',' ',' ');
@@ -190,6 +203,8 @@ const fat_bpb_jumpboot:array[1..3] of byte=($EB,$58,$90);
       fat_using=1;
       fat_cluster_broken=2;
       fat_end=3;
+      ntfs_bpb_jumpboot:array[1..3] of byte=($EB,$52,$90);
+      ntfs_bpb_oemname:array[1..8] of char=('N','T','F','S',' ',' ',' ',' ');
       filesystem_fat12=0;
       filesystem_fat16=1;
       filesystem_fat32=2;
@@ -664,7 +679,7 @@ begin
  res.dir.directoryreserved1:=0;
  res.dir.directoryfilecreationdate:=date;
  res.dir.directoryfilecreationtime:=time;
- res.dir.directoryfilecreationtimetenthofsecond:=time.ElapsedSeconds shl 2 div 10;
+ res.dir.directoryfilecreationtimetenthofsecond:=time.ElapsedSeconds shl 1 div 10;
  res.dir.directorylastaccessdate:=date;
  res.dir.directorywritedate:=date;
  res.dir.directorywritetime:=time;
@@ -672,7 +687,7 @@ begin
  res.dir.directoryfirstclusterlowword:=ClusterPos shl 16 shr 16;
  if(FileAttr=fat_directory_file) then
   begin
-   res.dir.directoryattribute:=0;
+   res.dir.directoryattribute:=fat_attribute_archive;
    res.dir.directoryfilesize:=FileSize;
   end
  else if(FileAttr=fat_directory_directory) then
@@ -684,6 +699,8 @@ begin
   begin
    res.dir.directoryattribute:=fat_attribute_volume_id;
    res.dir.directoryfilesize:=0;
+   res.dir.directoryfirstclusterhighword:=0;
+   res.dir.directoryfirstclusterlowword:=0;
   end;
  {If the long directory exists,
   Move the Source's Long Directory Infomation to FAT directory structure}
