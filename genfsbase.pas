@@ -2,7 +2,7 @@ unit genfsbase;
 
 interface
 
-{$MODE OBJFPC}
+{$mode ObjFPC}
 
 uses Classes,SysUtils,fsbase;
 
@@ -30,15 +30,14 @@ type Integer=-$7FFFFFFF..$7FFFFFFF;
                    end;
      genfs_fat=packed record
                header:fat_header;
-               fatbit:byte;
-               entrypair:^fat_entry_pair;
+               entrystart:SizeUint;
                entrycount:SizeUint;
                datastart:SizeUint;
                end;
      genfs_fat32=packed record
                  header:fat32_header;
                  fsinfo:fat_fsinfo_structure;
-                 entrypair:^fat_entry_pair;
+                 entrystart:SizeUint;
                  entrycount:SizeUint;
                  datastart:SizeUint;
                  end;
@@ -87,23 +86,37 @@ type Integer=-$7FFFFFFF..$7FFFFFFF;
      genfs_inner_path=packed record
                       FileClass:array of byte;
                       FilePath:array of UnicodeString;
-                      FileOffset:array of SizeUint;
-                      FileDirSize:array of SizeUint;
-                      Count:SizeUint;
-                      {FileShortPath,FileShortStr are
-                      Only for FAT File System,if the file system is not FAT,it is ignored}
-                      FileFree:array of boolean;
-                      FileIsShort:array of boolean;
+                      FileMainPos:array of SizeUint;
+                      FileSubPos:array of SizeUint;
+                      {For FAT File System Only}
                       FileShortStr:array of string;
+                      {For FAT32 File System Only}
+                      FileStructSize:array of SizeUint;
+                      {For FAT File System Only}
+                      FilePrevNextCount:SizeUint;
+                      Count:SizeUint;
                       end;
      genfs_path_string=packed record
                        path:array of UnicodeString;
                        count:SizeUint;
                        end;
-     genfs_index_list=packed record
-                      index:array of SizeUint;
-                      count:SizeUint;
-                      end;
+     genfs_fat_cluster_list=packed record
+                            index:array of SizeUint;
+                            count:SizeUint;
+                            end;
+     genfs_fat_position_info=packed record
+                             MainPos:SizeUint;
+                             SubPos:SizeUint;
+                             end;
+     genfs_fat_position_info_list=packed record
+                                  item:array of genfs_fat_position_info;
+                                  size:array of SizeUint;
+                                  count:SizeUint;
+                                  end;
+     genfs_content=packed record
+                   content:array[1..512] of byte;
+                   size:word;
+                   end;
 
 function StringToUnicodeString(str:string):UnicodeString;
 operator := (x:byte)res:genfs_variant;
@@ -116,11 +129,11 @@ operator := (x:Integer)res:genfs_variant;
 operator := (x:Int64)res:genfs_variant;
 function genfs_filesystem_create(fn:UnicodeString;fstype:byte;Size:SizeUint;param:array of genfs_variant):genfs_filesystem;
 function genfs_filesystem_read(fn:UnicodeString):genfs_filesystem;
-procedure genfs_filesystem_add(var fs:genfs_filesystem;srcpath:UnicodeString;indestpath:UnicodeString);
-procedure genfs_filesystem_delete(var fs:genfs_filesystem;delpath:UnicodeString);
-procedure genfs_filesystem_extract(fs:genfs_filesystem;srcpath:UnicodeString;destpath:UnicodeString);
+procedure genfs_filesystem_add_file(var fs:genfs_filesystem;srcdir:UnicodeString;destdir:UnicodeString);
+procedure genfs_filesystem_copy_file(var fs:genfs_filesystem;srcdir:UnicodeString;destdir:UnicodeString);
+procedure genfs_filesystem_delete_file(var fs:genfs_filesystem;deldir:UnicodeString;erase:boolean=false);
+procedure genfs_filesystem_extract_file(fs:genfs_filesystem;indir,extdir:UnicodeString);
 procedure genfs_filesystem_free(var fs:genfs_filesystem);
-function genfs_is_mask(detectstr:UnicodeString):boolean;
 
 implementation
 
@@ -140,6 +153,7 @@ end;
 function StringToUnicodeString(str:string):UnicodeString;
 var i:SizeUint;
 begin
+ Result:='';
  SetLength(Result,length(str));
  for i:=1 to length(str) do Result[i]:=str[i];
 end;
@@ -267,7 +281,37 @@ begin
  f.Seek(offset,0);
  for i:=1 to Size do
   begin
+   if(offset+i-1>f.Size) then
+   PByte(@dest+i-1)^:=0
+   else
    f.Read(PByte(@dest+i-1)^,1);
+  end;
+ f.free;
+end;
+{Standard I/O Moving}
+procedure genfs_io_move(fs:genfs_filesystem;startoffset:SizeUint;endoffset:SizeUint;MoveSize:SizeUint);
+var f:TFileStream;
+    i:SizeUint;
+    iobyte:byte=0;
+begin
+ if(MoveSize=0) then exit;
+ if(FileExists(fs.linkfilename)) then
+ f:=TFileStream.Create(UnicodeStringToString(fs.linkfilename),fmOpenReadWrite)
+ else
+ f:=TFileStream.Create(UnicodeStringToString(fs.linkfilename),fmCreate);
+ for i:=1 to MoveSize do
+  begin
+   if(startoffset+i-1>f.Size) then iobyte:=0
+   else
+    begin
+     f.Seek(startoffset+i-1,0);
+     f.Read(iobyte,1);
+     f.Seek(endoffset+i-1,0);
+     f.Write(iobyte,1);
+     iobyte:=0;
+     f.Seek(startoffset+i-1,0);
+     f.Write(iobyte,1);
+    end;
   end;
  f.free;
 end;
@@ -305,11 +349,47 @@ end;
 {Standard external Size}
 function genfs_external_file_Size(fn:UnicodeString):SizeUint;
 var f:TFileStream;
-    i:SizeUint;
 begin
  f:=TFileStream.Create(UnicodeStringToString(fn),fmOpenRead);
  Result:=f.Size;
  f.free;
+end;
+{Standard Get File Path without file name}
+function genfs_extract_file_path(fp:UnicodeString):UnicodeString;
+var i,len:SizeUint;
+begin
+ len:=length(fp); i:=len;
+ while(i>0)do
+  begin
+   if(fp[i]='/') or (fp[i]='\') then break;
+   dec(i);
+  end;
+ Result:=Copy(fp,1,i-1);
+end;
+{Standard Get File Name with extension}
+function genfs_extract_file_name(fn:UnicodeString):UnicodeString;
+var i,len:SizeUint;
+begin
+ len:=length(fn); i:=len;
+ while(i>0)do
+  begin
+   if(fn[i]='/') or (fn[i]='\') then break;
+   dec(i);
+  end;
+ Result:=Copy(fn,i+1,len-i);
+end;
+{Standard Vaildate Vaild File Name}
+function genfs_check_file_name(fn:UnicodeString):boolean;
+var tempstr:UnicodeString;
+    i,len:SizeUint;
+begin
+ tempstr:=genfs_extract_file_name(fn); i:=1; len:=length(tempstr);
+ while(i<=len)do
+  begin
+   if(tempstr[i]='.') then break;
+   inc(i);
+  end;
+ if(i<=len) then Result:=true else Result:=false;
 end;
 {Standard initializion}
 procedure genfs_filesystem_initialize(var dest);
@@ -416,66 +496,213 @@ begin
   end;
 end;
 {File System Infomation Write}
-procedure genfs_write(fs:genfs_filesystem;init:boolean=false);
-var i,tempnum1,tempnum2,tempnum3,tempnum4,tempnum5,tempnum6:SizeUint;
+procedure genfs_filesystem_write_info(fs:genfs_filesystem);
+var tempnum1,tempnum2,tempnum3,tempnum4:SizeUint;
 begin
  if(fs.fsname=filesystem_fat12) then
   begin
-   genfs_io_write(fs,fs.fat12.header,0,sizeof(fat_header));
    tempnum1:=fs.fat12.header.head.bpb_bytesPerSector;
    tempnum2:=fs.fat12.header.head.bpb_SectorPerCluster;
-   tempnum3:=fs.fat12.header.head.bpb_FatSectorCount16;
-   tempnum4:=fs.fat12.header.head.bpb_ReservedSectorCount;
-   for i:=1 to fs.fat12.entrycount do
-    begin
-     if(init) and (i>1) then break;
-     genfs_io_write(fs,(fs.fat12.entrypair+i-1)^,
-     tempnum4*tempnum1+(i-1)*sizeof(fat12_entry_pair),
-     sizeof(fat12_entry_pair));
-     genfs_io_write(fs,(fs.fat12.entrypair+i-1)^,
-     (tempnum4+tempnum3)*tempnum1+(i-1)*sizeof(fat12_entry_pair),
-     sizeof(fat12_entry_pair));
-    end;
+   genfs_io_write(fs,fs.fat12.header,0,sizeof(fat_header));
   end
  else if(fs.fsname=filesystem_fat16) then
   begin
-   genfs_io_write(fs,fs.fat16.header,0,sizeof(fat_header));
    tempnum1:=fs.fat16.header.head.bpb_bytesPerSector;
    tempnum2:=fs.fat16.header.head.bpb_SectorPerCluster;
-   tempnum3:=fs.fat16.header.head.bpb_FatSectorCount16;
-   tempnum4:=fs.fat16.header.head.bpb_ReservedSectorCount;
-   for i:=1 to fs.fat16.entrycount do
-    begin
-     if(init) and (i>1) then break;
-     genfs_io_write(fs,(fs.fat16.entrypair+i-1)^,
-     tempnum4*tempnum1+(i-1)*sizeof(fat16_entry_pair),
-     sizeof(fat16_entry_pair));
-     genfs_io_write(fs,(fs.fat16.entrypair+i-1)^,
-     (tempnum4+tempnum3)*tempnum1+(i-1)*sizeof(fat16_entry_pair),
-     sizeof(fat16_entry_pair));
-    end;
+   genfs_io_write(fs,fs.fat16.header,0,sizeof(fat_header));
   end
  else if(fs.fsname=filesystem_fat32) then
   begin
-   genfs_io_write(fs,fs.fat32.header,0,sizeof(fat32_header));
-   tempnum6:=fs.fat32.header.exthead.bpb_backupBootSector;
-   tempnum5:=fs.fat32.header.exthead.bpb_filesysteminfo;
    tempnum1:=fs.fat32.header.head.bpb_bytesPerSector;
    tempnum2:=fs.fat32.header.head.bpb_SectorPerCluster;
-   tempnum3:=fs.fat32.header.exthead.bpb_FatSectorCount32;
-   tempnum4:=fs.fat32.header.head.bpb_ReservedSectorCount;
-   genfs_io_write(fs,fs.fat32.header,tempnum6*tempnum1,sizeof(fat32_header));
-   genfs_io_write(fs,fs.fat32.fsinfo,tempnum5*tempnum1,sizeof(fat_fsinfo_structure));
-   for i:=1 to fs.fat32.entrycount do
+   tempnum3:=fs.fat32.header.exthead.bpb_filesysteminfo;
+   tempnum4:=fs.fat32.header.exthead.bpb_backupBootSector;
+   genfs_io_write(fs,fs.fat32.header,0,sizeof(fat32_header));
+   genfs_io_write(fs,fs.fat32.fsinfo,tempnum3*tempnum1*tempnum2,sizeof(fat_fsinfo_structure));
+   genfs_io_write(fs,fs.fat32.header,tempnum4*tempnum1*tempnum2,sizeof(fat32_header));
+  end
+ else if(fs.fsname=filesystem_exfat) then
+  begin
+
+  end
+ else if(fs.fsname=filesystem_ntfs) then
+  begin
+
+  end
+ else if(fs.fsname=filesystem_ext2) then
+  begin
+
+  end
+ else if(fs.fsname=filesystem_ext3) then
+  begin
+
+  end
+ else if(fs.fsname=filesystem_ext4) then
+  begin
+
+  end
+ else if(fs.fsname=filesystem_btrfs) then
+  begin
+
+  end
+ else
+  begin
+
+  end;
+end;
+{FAT Read Entry Value}
+function genfs_fat_read_entry(fs:genfs_filesystem;position:SizeUint):fat_entry;
+var pairpos,pairindex:SizeUint;
+    tempnum1,tempnum2:SizeUint;
+    entrypair,comparepair:fat_entry_pair;
+begin
+ pairpos:=position shr 1; pairindex:=position mod 2;
+ if(fs.fsname=filesystem_fat12) then
+  begin
+   tempnum1:=fs.fat12.header.head.bpb_bytesPerSector;
+   tempnum2:=fs.fat12.header.head.bpb_FatSectorCount16;
+   genfs_io_read(fs,entrypair.entry12,fs.fat12.entrystart
+   +pairpos*sizeof(fat12_entry_pair),sizeof(fat12_entry_pair));
+   genfs_io_read(fs,comparepair.entry12,fs.fat12.entrystart
+   +tempnum1*tempnum2+pairpos*sizeof(fat12_entry_pair),sizeof(fat12_entry_pair));
+   if(comparepair.entry12.entry1<>entrypair.entry12.entry1)or
+   (comparepair.entry12.entry2<>entrypair.entry12.entry2)then
+   entrypair.entry12:=comparepair.entry12;
+   if(pairindex=0) then
+   Result.entry12:=entrypair.entry12.entry1
+   else
+   Result.entry12:=entrypair.entry12.entry2;
+  end
+ else if(fs.fsname=filesystem_fat16) then
+  begin
+   tempnum1:=fs.fat16.header.head.bpb_bytesPerSector;
+   tempnum2:=fs.fat16.header.head.bpb_FatSectorCount16;
+   genfs_io_read(fs,entrypair.entry16,fs.fat16.entrystart
+   +pairpos*sizeof(fat16_entry_pair),sizeof(fat16_entry_pair));
+   genfs_io_read(fs,comparepair.entry16,fs.fat16.entrystart
+   +tempnum1*tempnum2+pairpos*sizeof(fat16_entry_pair),sizeof(fat16_entry_pair));
+   if(comparepair.entry16[pairindex+1]<>entrypair.entry16[pairindex+1])then
+   entrypair.entry16:=comparepair.entry16;
+   Result.entry16:=entrypair.entry16[pairindex+1];
+  end
+ else if(fs.fsname=filesystem_fat32) then
+  begin
+   tempnum1:=fs.fat32.header.head.bpb_bytesPerSector;
+   tempnum2:=fs.fat32.header.exthead.bpb_FatSectorCount32;
+   genfs_io_read(fs,entrypair.entry32,fs.fat32.entrystart
+   +pairpos*sizeof(fat32_entry_pair),sizeof(fat32_entry_pair));
+   genfs_io_read(fs,comparepair.entry32,fs.fat32.entrystart
+   +tempnum1*tempnum2+pairpos*sizeof(fat32_entry_pair),sizeof(fat32_entry_pair));
+   if(comparepair.entry32[pairindex+1]<>entrypair.entry32[pairindex+1])then
+   entrypair.entry32:=comparepair.entry32;
+   Result.entry32:=entrypair.entry32[pairindex+1];
+  end
+ else
+  begin
+   Result.entry32:=0;
+  end;
+end;
+{FAT Write Entry Value}
+procedure genfs_fat_write_entry(fs:genfs_filesystem;entry:fat_entry;position:SizeUint);
+var pairpos,pairindex:SizeUint;
+    tempentrypair:fat_entry_pair;
+    tempnum1,tempnum2:SizeUint;
+begin
+ pairpos:=position shr 1; pairindex:=position mod 2;
+ if(fs.fsname=filesystem_fat12) then
+  begin
+   tempnum1:=fs.fat12.header.head.bpb_FatSectorCount16;
+   tempnum2:=fs.fat12.header.head.bpb_bytesPerSector;
+   genfs_io_read(fs,tempentrypair,fs.fat12.entrystart
+   +pairpos*sizeof(fat12_entry_pair),sizeof(fat12_entry_pair));
+   if(pairindex=0) then
+   tempentrypair.entry12.entry1:=entry.entry12
+   else
+   tempentrypair.entry12.entry2:=entry.entry12;
+   genfs_io_write(fs,tempentrypair,fs.fat12.entrystart
+   +pairpos*sizeof(fat12_entry_pair),sizeof(fat12_entry_pair));
+   genfs_io_write(fs,tempentrypair,fs.fat12.entrystart
+   +tempnum1*tempnum2+pairpos*sizeof(fat12_entry_pair),sizeof(fat12_entry_pair));
+  end
+ else if(fs.fsname=filesystem_fat16) then
+  begin
+   tempnum1:=fs.fat16.header.head.bpb_FatSectorCount16;
+   tempnum2:=fs.fat16.header.head.bpb_bytesPerSector;
+   genfs_io_read(fs,tempentrypair,fs.fat16.entrystart
+   +pairpos*sizeof(fat16_entry_pair),sizeof(fat16_entry_pair));
+   tempentrypair.entry16[pairindex+1]:=entry.entry16;
+   genfs_io_write(fs,tempentrypair,fs.fat16.entrystart
+   +pairpos*sizeof(fat16_entry_pair),sizeof(fat16_entry_pair));
+   genfs_io_write(fs,tempentrypair,fs.fat16.entrystart
+   +tempnum1*tempnum2+pairpos*sizeof(fat16_entry_pair),sizeof(fat16_entry_pair));
+  end
+ else if(fs.fsname=filesystem_fat32) then
+  begin
+   tempnum1:=fs.fat32.header.exthead.bpb_FatSectorCount32;
+   tempnum2:=fs.fat32.header.head.bpb_bytesPerSector;
+   genfs_io_read(fs,tempentrypair,fs.fat32.entrystart
+   +pairpos*sizeof(fat32_entry_pair),sizeof(fat32_entry_pair));
+   tempentrypair.entry32[pairindex+1]:=entry.entry32;
+   genfs_io_write(fs,tempentrypair,fs.fat32.entrystart
+   +pairpos*sizeof(fat32_entry_pair),sizeof(fat32_entry_pair));
+   genfs_io_write(fs,tempentrypair,fs.fat32.entrystart
+   +tempnum1*tempnum2+pairpos*sizeof(fat32_entry_pair),sizeof(fat32_entry_pair));
+  end;
+end;
+{File System Read}
+function genfs_filesystem_read(fn:UnicodeString):genfs_filesystem;
+var tempnum1,tempnum2,tempnum3:SizeUint;
+begin
+ {Confirm the linked file name}
+ Result.linkfilename:=fn;
+ {Confirm the file system type}
+ Result.fsname:=genfs_filesystem_get_type(Result);
+ {File System Specified Reading}
+ if(Result.fsname=filesystem_fat12) then
+  begin
+   genfs_io_read(Result,Result.fat12.header,0,sizeof(fat_header));
+   tempnum1:=Result.fat12.header.head.bpb_bytesPerSector;
+   tempnum2:=Result.fat12.header.head.bpb_ReservedSectorCount;
+   tempnum3:=Result.fat12.header.head.bpb_FatSectorCount16;
+   Result.fat12.entrystart:=tempnum1*tempnum2;
+   Result.fat12.datastart:=tempnum1*(tempnum2+tempnum3*2);
+   Result.fat12.entrycount:=tempnum1*tempnum3 div 3;
+  end
+ else if(Result.fsname=filesystem_fat16) then
+  begin
+   genfs_io_read(Result,Result.fat16.header,0,sizeof(fat_header));
+   tempnum1:=Result.fat16.header.head.bpb_bytesPerSector;
+   tempnum2:=Result.fat16.header.head.bpb_ReservedSectorCount;
+   tempnum3:=Result.fat16.header.head.bpb_FatSectorCount16;
+   Result.fat16.entrystart:=tempnum1*tempnum2;
+   Result.fat16.datastart:=tempnum1*(tempnum2+tempnum3*2);
+   Result.fat16.entrycount:=tempnum1*tempnum3 shr 2;
+  end
+ else if(Result.fsname=filesystem_fat32) then
+  begin
+   genfs_io_read(Result,Result.fat32.header,0,sizeof(fat32_header));
+   if(Result.fat32.header.head.bpb_jumpboot[1]<>fat_bpb_jumpboot[1])
+   or(Result.fat32.header.head.bpb_jumpboot[2]<>fat_bpb_jumpboot[2])
+   or(Result.fat32.header.head.bpb_jumpboot[3]<>fat_bpb_jumpboot[3]) then
     begin
-     if(init) and (i>1) then break;
-     genfs_io_write(fs,(fs.fat32.entrypair+i-1)^,
-     tempnum4*tempnum1+(i-1)*sizeof(fat32_entry_pair),
-     sizeof(fat32_entry_pair));
-     genfs_io_write(fs,(fs.fat32.entrypair+i-1)^,
-     (tempnum4+tempnum3)*tempnum1+(i-1)*sizeof(fat32_entry_pair),
-     sizeof(fat32_entry_pair));
+     genfs_io_read(Result,Result.fat32.header,
+     Result.fat32.header.head.bpb_bytesPerSector*Result.fat32.header.exthead.bpb_backupBootSector,
+     sizeof(fat32_header));
+     genfs_io_write(Result,Result.fat32.header,0,sizeof(fat32_header));
     end;
+   genfs_io_read(Result,Result.fat32.fsinfo,
+   Result.fat32.header.head.bpb_bytesPerSector*Result.fat32.header.exthead.bpb_filesysteminfo,
+   sizeof(fat_fsinfo_structure));
+   tempnum1:=Result.fat32.header.head.bpb_bytesPerSector;
+   tempnum2:=Result.fat32.header.head.bpb_ReservedSectorCount;
+   tempnum3:=Result.fat32.header.exthead.bpb_FatSectorCount32;
+   Result.fat32.entrystart:=tempnum1*tempnum2;
+   Result.fat32.datastart:=tempnum1*(tempnum2+tempnum3*2);
+   Result.fat32.entrycount:=tempnum1*tempnum3 shr 3;
+  end
+ else if(Result.fsname=filesystem_exfat) then
+  begin
+
   end
  else
   begin
@@ -484,6 +711,8 @@ begin
 end;
 {File System create}
 function genfs_filesystem_create(fn:UnicodeString;fstype:byte;Size:SizeUint;param:array of genfs_variant):genfs_filesystem;
+{For FAT FileSystem Only}
+var entrypair:fat_entry_pair;
 begin
  {Pass the genfs's corresponding file name in disk}
  Result.linkfilename:=fn;
@@ -503,7 +732,6 @@ begin
    Result.fat12.header.head.bpb_FatSectorCount16:=param[3].genfs_word;
    Result.fat12.header.head.bpb_TotalSector16:=Size shl 20 div param[0].genfs_word;
    Result.fat12.header.head.bpb_TotalSector32:=0;
-   Result.fat12.fatbit:=12;
    {Other universal parameters}
    fat_jump_boot_move(Result.fat12.header.head.bpb_jumpboot);
    fat_oem_name_move(Result.fat12.header.head.bpb_oemname);
@@ -521,10 +749,12 @@ begin
    fat_default_file_system_type_move(12,Result.fat12.header.exthead.bs_filesystem_type);
    Result.fat12.header.exthead.bs_signature:=$AA55;
    {FAT12 entry initialization}
-   Result.fat12.entrypair:=allocmem(param[3].genfs_word*param[0].genfs_word div 3*sizeof(fat_entry_pair));
-   Result.fat12.entrypair^.entry12.entry1:=$FF8;
-   Result.fat12.entrypair^.entry12.entry2:=$C00;
+   Result.fat12.entrystart:=param[2].genfs_word*param[0].genfs_word;
    Result.fat12.entrycount:=param[3].genfs_word*param[0].genfs_word div 3;
+   entrypair.entry12.entry1:=$FF8; entrypair.entry12.entry2:=$C00;
+   genfs_io_write(Result,entrypair.entry12,Result.fat12.entrystart,sizeof(fat12_entry_pair));
+   genfs_io_write(Result,entrypair.entry12,Result.fat12.entrystart
+   +param[3].genfs_word*param[0].genfs_word,sizeof(fat12_entry_pair));
    {FAT12 data position initialization}
    Result.fat12.datastart:=param[0].genfs_word*(param[2].genfs_word+param[3].genfs_word*2);
   end
@@ -537,7 +767,6 @@ begin
    Result.fat16.header.head.bpb_FatSectorCount16:=param[3].genfs_word;
    Result.fat16.header.head.bpb_TotalSector16:=Size shl 20 div param[0].genfs_word;
    Result.fat16.header.head.bpb_TotalSector32:=0;
-   Result.fat16.fatbit:=16;
    {Other universal parameters}
    fat_jump_boot_move(Result.fat16.header.head.bpb_jumpboot);
    fat_oem_name_move(Result.fat16.header.head.bpb_oemname);
@@ -555,10 +784,12 @@ begin
    fat_default_file_system_type_move(16,Result.fat16.header.exthead.bs_filesystem_type);
    Result.fat16.header.exthead.bs_signature:=$AA55;
    {FAT16 entry initialization}
-   Result.fat16.entrypair:=allocmem(param[3].genfs_word*param[0].genfs_word shr 2*sizeof(fat_entry_pair));
-   Result.fat16.entrypair^.entry16[1]:=$FFF8;
-   Result.fat16.entrypair^.entry16[2]:=$C000;
+   Result.fat16.entrystart:=param[2].genfs_word*param[0].genfs_word;
    Result.fat16.entrycount:=param[3].genfs_word*param[0].genfs_word shr 2;
+   entrypair.entry16[1]:=$FFF8; entrypair.entry16[2]:=$C000;
+   genfs_io_write(Result,entrypair.entry16,Result.fat16.entrystart,sizeof(fat16_entry_pair));
+   genfs_io_write(Result,entrypair.entry16,Result.fat16.entrystart
+   +param[3].genfs_word*param[0].genfs_word,sizeof(fat16_entry_pair));
    {FAT16 data position initialization}
    Result.fat16.datastart:=param[0].genfs_word*(param[2].genfs_word+param[3].genfs_word*2);
   end
@@ -594,17 +825,19 @@ begin
    Result.fat32.header.exthead.bpb_ExtendedFlags.FATmirrordisable:=0;
    Result.fat32.header.exthead.bpb_ExtendedFlags.NumberOfActiveFAT:=0;
    {FAT32 entry initialization}
-   Result.fat32.entrypair:=allocmem(param[3].genfs_word*param[0].genfs_word shr 3*sizeof(fat_entry_pair));
-   Result.fat32.entrypair^.entry32[1]:=$FFFFFF8;
-   Result.fat32.entrypair^.entry32[2]:=$0C00000;
+   entrypair.entry32[1]:=$FFFFFF8; entrypair.entry32[2]:=$C000000;
+   Result.fat32.entrystart:=param[2].genfs_word*param[0].genfs_word;
    Result.fat32.entrycount:=param[3].genfs_word*param[0].genfs_word shr 3;
+   genfs_io_write(Result,entrypair.entry32,Result.fat32.entrystart,sizeof(fat32_entry_pair));
+   genfs_io_write(Result,entrypair.entry32,Result.fat32.entrystart
+   +param[3].genfs_word*param[0].genfs_word,sizeof(fat32_entry_pair));
    {FAT32 data position initialization}
    Result.fat32.datastart:=param[0].genfs_word*(param[2].genfs_word+param[3].genfs_word*2);
    {FAT32 file system info initialization}
    Result.fat32.fsinfo.leadsignature:=fat32_lead_signature;
    Result.fat32.fsinfo.structsignature:=fat32_struct_signature;
    Result.fat32.fsinfo.trailsignature:=fat32_trail_signature;
-   Result.fat32.fsinfo.nextfree:=param[4].genfs_word;
+   Result.fat32.fsinfo.nextfree:=2;
    Result.fat32.fsinfo.freecount:=
    (Size shl 20 div param[0].genfs_word-2*param[3].genfs_dword-param[2].genfs_word)
    div (param[0].genfs_word*param[1].genfs_byte);
@@ -613,135 +846,22 @@ begin
   begin
 
   end;
- genfs_write(Result,true);
-end;
-{File System Read and recognize}
-function genfs_filesystem_read(fn:UnicodeString):genfs_filesystem;
-var i:SizeUint;
-    tempnum1,tempnum2,tempnum3:SizeUint;
-    {For FAT File System Only}
-    fatentry:fat_entry_pair;
-begin
- {Pass the genfs's corresponding file name in disk}
- Result.linkfilename:=fn;
- {Check the image file's file system name}
- Result.fsname:=genfs_filesystem_get_type(Result);
- {Initialize the genfs filesystem record}
- genfs_filesystem_initialize(Result);
- {Initialize the genfs specific system}
- if(Result.fsname=filesystem_fat12) then
-  begin
-   {Read the FAT12 Header}
-   genfs_io_read(Result,Result.fat12.header,0,sizeof(fat_header));
-   tempnum1:=Result.fat12.header.head.bpb_ReservedSectorCount;
-   tempnum2:=Result.fat12.header.head.bpb_FatSectorCount16;
-   tempnum3:=Result.fat12.header.head.bpb_bytesPerSector;
-   Result.fat12.fatbit:=12;
-   {Read the FAT12 entry}
-   Result.fat12.entrypair:=allocmem(tempnum2*tempnum3);
-   i:=1;
-   while(i<=tempnum2*tempnum3 div sizeof(fat12_entry_pair)) do
-    begin
-     genfs_io_read(Result,(Result.fat12.entrypair+i-1)^,tempnum1*tempnum3+
-     (i-1)*sizeof(fat12_entry_pair),sizeof(fat12_entry_pair));
-     genfs_io_read(Result,fatentry,(tempnum1+tempnum2)*tempnum3+
-     (i-1)*sizeof(fat12_entry_pair),sizeof(fat12_entry_pair));
-     if((Result.fat12.entrypair+i-1)^.entry12.entry1<>fatentry.entry12.entry1)
-     or((Result.fat12.entrypair+i-1)^.entry12.entry2<>fatentry.entry12.entry2) then
-     (Result.fat12.entrypair+i-1)^:=fatentry;
-     inc(i);
-    end;
-   Result.fat12.entrycount:=tempnum2*tempnum3 div sizeof(fat12_entry_pair);
-   {Calculate the data start position}
-   Result.fat12.datastart:=(tempnum1+tempnum2*2)*tempnum3;
-  end
- else if(Result.fsname=filesystem_fat16) then
-  begin
-   {Read the FAT16 header}
-   genfs_io_read(Result,Result.fat16.header,0,sizeof(fat_header));
-   tempnum1:=Result.fat16.header.head.bpb_ReservedSectorCount;
-   tempnum2:=Result.fat16.header.head.bpb_FatSectorCount16;
-   tempnum3:=Result.fat16.header.head.bpb_bytesPerSector;
-   Result.fat16.fatbit:=16;
-   {Read the FAT16 entry}
-   Result.fat16.entrypair:=allocmem(tempnum2*tempnum3);
-   i:=1;
-   while(i<=tempnum2*tempnum3 div sizeof(fat16_entry_pair)) do
-    begin
-     genfs_io_read(Result,(Result.fat16.entrypair+i-1)^,tempnum1*tempnum3+
-     (i-1)*sizeof(fat16_entry_pair),sizeof(fat16_entry_pair));
-     genfs_io_read(Result,fatentry,(tempnum1+tempnum2)*tempnum3+
-     (i-1)*sizeof(fat16_entry_pair),sizeof(fat16_entry_pair));
-     if((Result.fat16.entrypair+i-1)^.entry16[1]<>fatentry.entry16[1])
-     or((Result.fat16.entrypair+i-1)^.entry16[2]<>fatentry.entry16[2]) then
-     (Result.fat16.entrypair+i-1)^:=fatentry;
-     inc(i);
-    end;
-   Result.fat16.entrycount:=tempnum2*tempnum3 div sizeof(fat16_entry_pair);
-   {Calculate the data start position}
-   Result.fat16.datastart:=(tempnum1+tempnum2*2)*tempnum3;
-  end
- else if(Result.fsname=filesystem_fat32) then
-  begin
-   {Read the FAT32 header}
-   genfs_io_read(Result,Result.fat32.header,0,sizeof(fat32_header));
-   tempnum1:=Result.fat32.header.head.bpb_ReservedSectorCount;
-   tempnum2:=Result.fat32.header.exthead.bpb_FatSectorCount32;
-   tempnum3:=Result.fat32.header.head.bpb_bytesPerSector;
-   if(Result.fat32.header.head.bpb_jumpboot[1]<>$EB) or
-   (Result.fat32.header.head.bpb_jumpboot[2]<>$58) or
-   (Result.fat32.header.head.bpb_jumpboot[3]<>$90) then
-    begin
-     genfs_io_read(Result,Result.fat32.header,
-     Result.fat32.header.exthead.bpb_backupBootSector*tempnum3,sizeof(fat32_header));
-     genfs_io_write(Result,Result.fat32.header,0,sizeof(fat32_header));
-    end;
-   {Read the FAT32 FileSystemInfo}
-   genfs_io_read(Result,Result.fat32.fsinfo,
-   Result.fat32.header.exthead.bpb_filesysteminfo*tempnum3,sizeof(fat_fsinfo_structure));
-   {Read the FAT32 entry}
-   i:=1;
-   Result.fat32.entrypair:=allocmem(tempnum2*tempnum3);
-   while(i<=tempnum2*tempnum3 div sizeof(fat32_entry_pair)) do
-    begin
-     genfs_io_read(Result,(Result.fat32.entrypair+i-1)^,tempnum1*tempnum3+
-     (i-1)*sizeof(fat32_entry_pair),sizeof(fat32_entry_pair));
-     genfs_io_read(Result,fatentry,(tempnum1+tempnum2)*tempnum3+
-     (i-1)*sizeof(fat32_entry_pair),sizeof(fat32_entry_pair));
-     if((Result.fat32.entrypair+i-1)^.entry32[1]<>fatentry.entry32[1])
-     or((Result.fat32.entrypair+i-1)^.entry32[2]<>fatentry.entry32[2]) then
-     (Result.fat32.entrypair+i-1)^:=fatentry;
-     inc(i);
-    end;
-   Result.fat32.entrycount:=tempnum2*tempnum3 div sizeof(fat32_entry_pair);
-   {Calculate the FAT32 data start}
-   Result.fat32.datastart:=(tempnum1+tempnum2*2)*tempnum3;
-  end
- else
-  begin
-
-  end;
+ genfs_filesystem_write_info(Result);
 end;
 {File System Free}
 procedure genfs_filesystem_free(var fs:genfs_filesystem);
 begin
  if(fs.fsname=filesystem_fat12) then
   begin
-   fs.fsname:=9;
-   FreeMem(fs.fat12.entrypair);
-   fs.fat12.entrycount:=0;
+   fs.fsname:=$FF; fs.fat12.entrycount:=0;
   end
  else if(fs.fsname=filesystem_fat16) then
   begin
-   fs.fsname:=9;
-   FreeMem(fs.fat16.entrypair);
-   fs.fat16.entrycount:=0;
+   fs.fsname:=$FF; fs.fat16.entrycount:=0;
   end
  else if(fs.fsname=filesystem_fat32) then
   begin
-   fs.fsname:=9;
-   FreeMem(fs.fat32.entrypair);
-   fs.fat32.entrycount:=0;
+   fs.fsname:=$FF; fs.fat32.entrycount:=0;
   end
  else
   begin
@@ -802,14 +922,16 @@ begin
  if(j>len2) then Result:=true else Result:=false;
 end;
 {External File System detection}
-function genfs_search_for_path_external(basedir:UnicodeString;ismask:boolean):genfs_path;
+function genfs_external_search_for_path(basedir:UnicodeString):genfs_path;
 var SearchRec:TUnicodeSearchRec;
     Order:Longint;
     bool:boolean;
     tempstr:UnicodeString;
     temppath:genfs_path;
     i:SizeUint;
+    ismask:boolean;
 begin
+ ismask:=genfs_is_mask(basedir);
  Result.count:=0; Order:=0; bool:=false;
  if(FileExists(basedir)) then
   begin
@@ -836,7 +958,7 @@ begin
    SetLength(Result.IsFile,Result.count);
    Result.FilePath[Result.count-1]:=tempstr;
    Result.IsFile[Result.count-1]:=false;
-   temppath:=genfs_search_for_path_external(tempstr,ismask);
+   temppath:=genfs_external_search_for_path(tempstr);
    for i:=1 to temppath.count do
     begin
      inc(Result.count);
@@ -875,7 +997,7 @@ end;
 function genfs_check_prefix(prevpath,nextpath:UnicodeString;isnextdir:Boolean=false):boolean;
 var i,len,len2:SizeUint;
 begin
- if(length(prevpath)>length(nextpath)) then
+ if(length(prevpath)>=length(nextpath)) then
   begin
    genfs_check_prefix:=false;
   end
@@ -887,10 +1009,11 @@ begin
      if(prevpath[i]<>nextpath[i]) then break;
      inc(i);
     end;
-   inc(i,2);
+   inc(i,1);
    while(i<=len2) and (isnextdir) do
     begin
      if(nextpath[i]='/') or (nextpath[i]='\') then break;
+     if(i=len+1) and (Copy(nextpath,i,2)='..') or (Copy(nextpath,i,1)='.') then break;
      inc(i);
     end;
    if(i>len) and (isnextdir=false) then genfs_check_prefix:=true
@@ -926,290 +1049,341 @@ begin
        Result.path[Result.count-1]:=Copy(tempstr,1,i-1);
       end;
      Delete(tempstr,1,i); i:=1; continue;
+    end
+   else if(i>length(tempstr)) then
+    begin
+     inc(Result.count);
+     SetLength(Result.path,Result.count);
+     Result.path[Result.count-1]:=tempstr;
+     Delete(tempstr,1,i);
     end;
    inc(i);
   end;
 end;
-{Detect the file and directory in image}
-function genfs_search_for_path(fs:genfs_filesystem;
-basedir:Unicodestring;startoffset:SizeUint=0;Subdir:boolean=true):genfs_inner_path;
-var fatstr:fat_string;
-    tempstr:PWideChar;
-    temppath:genfs_inner_path;
-    i,offset,sizerec,tempnum,tempnum2,ii1,ii2:SizeUint;
-    detectcontent:array[1..32] of Byte;
-    bool:boolean;
-    {If the search path is not on Root Directory,pathstr is used}
-    pathstr:genfs_path_string;
-    index:SizeUint;
+{File System Search Path without wildchar}
+function genfs_extract_search_path_without_wildcard(path:UnicodeString):UnicodeString;
+var i,j,len:SizeUint;
 begin
- i:=1; Result.Count:=0;
- SetLength(Result.FilePath,0); SetLength(Result.FileClass,0);
- SetLength(Result.FileIsShort,0); SetLength(Result.FileFree,0);
- SetLength(Result.FileDirSize,0); SetLength(Result.FileOffset,0);
+ if(genfs_is_mask(path)) then
+  begin
+   i:=1; len:=length(path);
+   while(i<=len)do
+    begin
+     if(path[i]='*') or (path[i]='?') then break;
+     inc(i);
+    end;
+   j:=i;
+   while(j>0)do
+    begin
+     if(path[j]='/') or (path[j]='\') then break;
+     dec(j);
+    end;
+   Result:=Copy(path,1,j-1);
+  end
+ else
+  begin
+   Result:=path;
+  end;
+end;
+{File System Search}
+function genfs_filesystem_search_for_path(const fs:genfs_filesystem;
+inputbasedir:UnicodeString='/';startpos:SizeUint=0):genfs_inner_path;
+var i:SizeUint;
+    SearchMainPos,SearchSubPos:SizeUint;
+    temppath:genfs_inner_path;
+    tempdirpos:SizeUint;
+    temppathstr:genfs_path_string;
+    temppathstrindex:SizeUint;
+    BaseDir:UnicodeString;
+    IsMask:boolean;
+{For FAT File System}
+    clustervalue:fat_entry;
+    fatstr:fat_string;
+    tempstr:PWideChar;
+    BytePerSector,SectorPerCluster:SizeUint;
+    unitcontent:array[1..32] of byte;
+{For FAT32 Only}
+    RootCluster:SizeUint;
+    recindex:SizeUint;
+    StartIndex:SizeUint;
+    StartOffset:SizeUint;
+begin
+ {Check the InputBaseDir is masked or not}
+ ismask:=genfs_is_mask(inputBaseDir);
+ if(ismask) then BaseDir:=genfs_extract_search_path_without_wildcard(inputBaseDir)
+ else BaseDir:=inputBaseDir;
+ {Initialize the Result.}
+ Result.Count:=0; Result.FilePrevNextCount:=0;
+ SetLength(Result.FileClass,1); SetLength(Result.FilePath,1);
+ SetLength(Result.FileMainPos,1); SetLength(Result.FileSubPos,1);
+ SetLength(Result.FileShortStr,1); SetLength(Result.FileStructSize,1);
+ fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+ for i:=1 to 32 do unitcontent[i]:=0;
  if(fs.fsname=filesystem_fat12) then
   begin
-   if(basedir='/') or (basedir='\') then
+   {Regain the FAT12 Information}
+   BytePerSector:=fs.fat12.header.head.bpb_bytesPerSector;
+   SectorPerCluster:=fs.fat12.header.head.bpb_SectorPerCluster;
+   if(startpos>2) or (basedir='/') or (basedir='\') then
     begin
-     offset:=0; fatstr.unicodefn:=nil; fatstr.unicodefncount:=0; bool:=false;
+     if(startpos>2) then
+      begin
+       {Indicate the Search Pos is a recursion from root directory}
+       SearchMainPos:=startpos; SearchSubPos:=0;
+      end
+     else
+      begin
+       {Indicate the Search Pos is on the root directory}
+       SearchMainPos:=2; SearchSubPos:=0;
+      end;
      while(True)do
       begin
-       genfs_io_read(fs,detectcontent,fs.fat12.datastart+offset,sizeof(fat_directory_structure));
-       if(detectcontent[1]=$00) and (bool=false) then
+       genfs_io_read(fs,unitcontent,fs.fat12.datastart+(SearchMainPos-2)
+       *BytePerSector*SectorPerCluster+
+       SearchSubPos*sizeof(fat_directory_structure),sizeof(fat_directory_structure));
+       inc(SearchSubPos);
+       if(unitcontent[1]=$00) then
         begin
-         if(fatstr.unicodefn<>nil) then
-          begin
-           FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-          end;
+         {Indicate the Directory is ended,exit the search.}
          break;
         end
-       else
+       else if(unitcontent[1]<>$E5) and (unitcontent[12]<>fat_attribute_long_name) then
         begin
-         fat_MoveDirStructStringToFatString(Pfat_directory_structure(@detectcontent)^,fatstr);
-         tempstr:=fat_FatStringToPWideChar(fatstr);
          inc(Result.Count);
-         SetLength(Result.FileFree,Result.count);
-         Result.FileFree[Result.count-1]:=detectcontent[1]=$E5;
-         SetLength(Result.FilePath,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FilePath[Result.count-1]:=basedir+tempstr
-         else Result.FilePath[Result.count-1]:='';
-         SetLength(Result.FileIsShort,Result.Count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FileIsShort[Result.count-1]:=true
-         else Result.FileIsShort[Result.count-1]:=false;
-         SetLength(Result.FileShortStr,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
+         {Files in FAT12 File System are always short name,Record it.}
+         SetLength(Result.FileShortStr,Result.Count);
          Result.FileShortStr[Result.count-1]:=
-         genfs_fat_extract_short_name(Pfat_directory_structure(@detectcontent)^)
-         else Result.FileShortStr[Result.count-1]:='';
-         SetLength(Result.FileOffset,Result.count);
-         Result.FileOffset[Result.count-1]:=offset;
-         SetLength(Result.FileClass,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
+         genfs_fat_extract_short_name(Pfat_directory_structure(@unitcontent)^);
+         {Record the File Class of Files}
+         SetLength(Result.FileClass,Result.Count);
          Result.FileClass[Result.count-1]:=
-         fat_is_file(Pfat_directory_structure(@detectcontent)^.directoryattribute)
+         fat_get_file_class(Pfat_directory_structure(@unitcontent)^.directoryattribute,false);
+         {Record the File Full Path}
+         SetLength(Result.FilePath,Result.count);
+         fat_MoveDirStructStringToFatString(Pfat_directory_structure(@unitcontent)^,fatstr);
+         tempstr:=fat_FatStringToPWideChar(fatstr);
+         if(basedir='\') or (basedir='/') then
+         Result.FilePath[Result.count-1]:=basedir+tempstr
          else
-         Result.FileClass[Result.count-1]:=0;
-         SetLength(Result.FileDirSize,Result.count);
-         Result.FileDirSize[Result.count-1]:=sizeof(fat_directory_structure);
-         if(Result.FileClass[Result.count-1]=fat_directory_directory)
-         and(UnicodeString(tempstr)<>'..') and (UnicodeString(tempstr)<>'.') and (subdir) then
+         Result.FilePath[Result.count-1]:=basedir+'/'+tempstr;
+         {Record the File Main Position(in cluster) and Sub Position(in number of
+         fat_directory_structure)}
+         SetLength(Result.FileMainPos,Result.count);
+         Result.FileMainPos[Result.count-1]:=SearchMainPos;
+         SetLength(Result.FileSubPos,Result.count);
+         Result.FileSubPos[Result.count-1]:=SearchSubPos-1;
+         if(UnicodeString(tempstr)='.') and (UnicodeString(tempstr)='..') then
+         inc(Result.FilePrevNextCount);
+         {If the file is directory,then search for this directory}
+         if(UnicodeString(tempstr)<>'.') and (UnicodeString(tempstr)<>'..') and
+         (Result.FileClass[Result.count-1]=fat_directory_directory) then
           begin
-           temppath:=genfs_search_for_path(fs,basedir+tempstr,
-           (Pfat_directory_structure(@detectcontent)^.directoryfirstclusterhighword shl 16+
-           Pfat_directory_structure(@detectcontent)^.directoryfirstclusterlowword-2)*
-           fs.fat12.header.head.bpb_SectorPerCluster*fs.fat12.header.head.bpb_bytesPerSector);
+           {Confirm the position of Directory Content(in cluster}
+           tempdirpos:=Pfat_directory_structure(@unitcontent)^.directoryfirstclusterhighword shl 16+
+           Pfat_directory_structure(@unitcontent)^.directoryfirstclusterlowword;
+           temppath:=genfs_filesystem_search_for_path(fs,
+           Result.FilePath[Result.count-1],tempdirpos);
+           {Insert the temppath's content to main Result}
            for i:=1 to temppath.Count do
             begin
-             inc(Result.Count);
+             inc(Result.count);
              SetLength(Result.FilePath,Result.count);
-             SetLength(Result.FileOffset,Result.count);
-             SetLength(Result.FileClass,Result.count);
-             SetLength(Result.FileDirSize,Result.count);
-             SetLength(Result.FileShortStr,Result.Count);
-             SetLength(Result.FileIsShort,Result.count);
              Result.FilePath[Result.count-1]:=temppath.FilePath[i-1];
-             Result.FileOffset[Result.count-1]:=temppath.FileOffset[i-1];
+             SetLength(Result.FileShortStr,Result.count);
+             Result.FileShortStr[Result.count-1]:=temppath.FileShortStr[i-1];
+             SetLength(Result.FileMainPos,Result.count);
+             Result.FileMainPos[Result.count-1]:=temppath.FileMainPos[i-1];
+             SetLength(Result.FileSubPos,Result.count);
+             Result.FileSubPos[Result.count-1]:=temppath.FileSubPos[i-1];
+             SetLength(Result.FileClass,Result.count);
              Result.FileClass[Result.count-1]:=temppath.FileClass[i-1];
-             Result.FileDirSize[Result.count-1]:=temppath.FileDirSize[i-1];
-             Result.FileShortStr[Result.Count-1]:=temppath.FileShortStr[i-1];
-             Result.FileIsShort[Result.count-1]:=true;
             end;
-          end;
-         if(fatstr.unicodefncount>0) then
-          begin
-           FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+           {Release the memory of variable temppath}
+           SetLength(temppath.FilePath,0);
+           SetLength(temppath.FileShortStr,0);
+           SetLength(temppath.FileMainPos,0);
+           SetLength(temppath.FileSubPos,0);
+           SetLength(temppath.FileClass,0);
           end;
          FreeMem(tempstr);
         end;
-       inc(offset,sizeof(fat_directory_structure));
-       tempnum:=offset div (fs.fat12.header.head.bpb_bytesPerSector*
-       fs.fat12.header.head.bpb_SectorPerCluster)+2;
-       tempnum2:=(offset-sizeof(fat_directory_structure)) div (fs.fat12.header.head.bpb_bytesPerSector*
-       fs.fat12.header.head.bpb_SectorPerCluster)+2;
-       if(tempnum>tempnum2) then
+       {If the read offset is on the boundary of the cluster,go to next cluster or search ended.}
+       if(SearchSubPos=BytePerSector*SectorPerCluster shr 5) then
         begin
-         ii1:=tempnum2 shr 1; ii2:=tempnum2 mod 2;
-         if(ii2=0) then
+         clustervalue:=genfs_fat_read_entry(fs,SearchMainPos);
+         if(fat12_check_cluster_status(clustervalue.entry12)=fat_end)
+         or(fat12_check_cluster_status(clustervalue.entry12)=fat_cluster_broken)then
           begin
-           if(fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry1)<>fat_using) then break
-           else offset:=
-           ((fs.fat12.entrypair+ii1)^.entry12.entry1-2)
-           *fs.fat12.header.head.bpb_bytesPerSector*fs.fat12.header.head.bpb_SectorPerCluster;
+           break;
           end
-         else if(ii2=1) then
+         else if(fat12_check_cluster_status(clustervalue.entry12)<>fat_end)
+         and(fat12_check_cluster_status(clustervalue.entry12)<>fat_cluster_broken)then
           begin
-           if(fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry2)<>fat_using) then break
-           else offset:=
-           ((fs.fat12.entrypair+ii1)^.entry12.entry2-2)
-           *fs.fat12.header.head.bpb_bytesPerSector*fs.fat12.header.head.bpb_SectorPerCluster;
+           SearchMainPos:=clustervalue.entry12;
+           SearchSubPos:=0;
           end;
         end;
       end;
     end
-   else
+   else if(startpos<=2) then
     begin
-     if(startoffset=0) then
-      begin
-       offset:=0; index:=1;
-       pathstr:=genfs_path_to_path_string(basedir);
-       fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-       while(index<=pathstr.count)do
-        begin
-         genfs_io_read(fs,detectcontent,fs.fat12.datastart+offset,sizeof(fat_directory_structure));
-         if(detectcontent[1]=$00) and (bool=false) then
-          begin
-           if(fatstr.unicodefn<>nil) then
-            begin
-             FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-            end;
-           break;
-          end
-         else if(detectcontent[12]<>fat_attribute_long_name) and (detectcontent[1]<>$E5) then
-          begin
-           fat_MoveDirStructStringToFatString(Pfat_directory_structure(@detectcontent)^,fatstr);
-           tempstr:=fat_FatStringToPWideChar(fatstr);
-           if(UnicodeString(tempstr)<>'..') and (UnicodeString(tempstr)<>'.')
-           and(fat_is_file(Pfat_directory_structure(@detectcontent)^.directoryattribute)
-           =fat_directory_directory) and (tempstr=pathstr.path[index-1]) then
-            begin
-             offset:=(Pfat_directory_structure(@detectcontent)^.directoryfirstclusterhighword shl 16
-             +Pfat_directory_structure(@detectcontent)^.directoryfirstclusterlowword-2)*
-             fs.fat12.header.head.bpb_SectorPerCluster*fs.fat12.header.head.bpb_bytesPerSector;
-             inc(index);
-             if(fatstr.unicodefncount>0) then
-              begin
-               FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-              end;
-             FreeMem(tempstr);
-             continue;
-            end;
-           if(fatstr.unicodefncount>0) then
-            begin
-             FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-            end;
-           FreeMem(tempstr);
-          end;
-         inc(offset,sizeof(fat_directory_structure));
-         tempnum:=offset div (fs.fat12.header.head.bpb_bytesPerSector*
-         fs.fat12.header.head.bpb_SectorPerCluster)+2;
-         tempnum2:=(offset-sizeof(fat_directory_structure)) div (fs.fat12.header.head.bpb_bytesPerSector*
-         fs.fat12.header.head.bpb_SectorPerCluster)+2;
-         if(tempnum>tempnum2) then
-          begin
-           ii1:=tempnum2 shr 1; ii2:=tempnum2 mod 2;
-           if(ii2=0) then
-            begin
-             if(fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry1)<>fat_using) then break
-             else offset:=
-             ((fs.fat12.entrypair+ii1)^.entry12.entry1-2)
-             *fs.fat12.header.head.bpb_bytesPerSector*fs.fat12.header.head.bpb_SectorPerCluster;
-            end
-           else if(ii2=1) then
-            begin
-             if(fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry2)<>fat_using) then break
-             else offset:=
-             ((fs.fat12.entrypair+ii1)^.entry12.entry2-2)
-             *fs.fat12.header.head.bpb_bytesPerSector*fs.fat12.header.head.bpb_SectorPerCluster;
-            end;
-          end;
-        end;
-      end
-     else offset:=startoffset;
-     fatstr.unicodefn:=nil; fatstr.unicodefncount:=0; bool:=false;
+     {Indicate the basedir is not root directory or recurse from root directory.}
+     SearchMainPos:=2; SearchSubPos:=0;
+     temppathstrindex:=1; temppathstr:=genfs_path_to_path_string(basedir);
+     {Go to the basedir pointed directory.}
      while(True)do
       begin
-       genfs_io_read(fs,detectcontent,fs.fat12.datastart+offset,sizeof(fat_directory_structure));
-       if(detectcontent[1]=$00) and (bool=false) then
+       genfs_io_read(fs,unitcontent,fs.fat12.datastart+(SearchMainPos-2)*
+       BytePerSector*SectorPerCluster+SearchSubPos*sizeof(fat_directory_structure),
+       sizeof(fat_directory_structure));
+       inc(SearchSubPos);
+       if(unitcontent[1]=$00) then
         begin
-         if(fatstr.unicodefn<>nil) then
-          begin
-           FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-          end;
          break;
         end
-       else if(detectcontent[12]<>fat_attribute_long_name) then
+       else if(unitcontent[1]<>$E5) and (unitcontent[12]<>fat_attribute_long_name) then
         begin
-         fat_MoveDirStructStringToFatString(Pfat_directory_structure(@detectcontent)^,fatstr);
+         fat_MoveDirStructStringToFatString(Pfat_directory_structure(@unitcontent)^,fatstr);
          tempstr:=fat_FatStringToPWideChar(fatstr);
-         inc(Result.Count);
-         SetLength(Result.FileFree,Result.count);
-         Result.FileFree[Result.count-1]:=detectcontent[1]=$E5;
-         SetLength(Result.FilePath,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FilePath[Result.count-1]:=basedir+'/'+tempstr
-         else Result.FilePath[Result.count-1]:='';
-         SetLength(Result.FileIsShort,Result.Count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FileIsShort[Result.count-1]:=true
-         else Result.FileIsShort[Result.count-1]:=false;
-         SetLength(Result.FileShortStr,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FileShortStr[Result.count-1]:=
-         genfs_fat_extract_short_name(Pfat_directory_structure(@detectcontent)^)
-         else Result.FileShortStr[Result.count-1]:='';
-         Result.FileOffset[Result.count-1]:=offset;
-         SetLength(Result.FileClass,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FileClass[Result.count-1]:=
-         fat_is_file(Pfat_directory_structure(@detectcontent)^.directoryattribute)
-         else
-         Result.FileClass[Result.count-1]:=0;
-         SetLength(Result.FileDirSize,Result.count);
-         Result.FileDirSize[Result.count-1]:=sizeof(fat_directory_structure);
-         if(Result.FileClass[Result.count-1]=fat_directory_directory)
-         and (Pfat_directory_structure(@detectcontent)^.directoryfilesize=0)
-         and (UnicodeString(tempstr)<>'..') and (UnicodeString(tempstr)<>'.') then
+         if(UnicodeString(tempstr)<>'.') and (UnicodeString(tempstr)<>'..') and
+         (temppathstr.path[temppathstrindex-1]=tempstr)
+         and(fat_get_file_class(Pfat_directory_structure(@unitcontent)^.directoryattribute,false)
+         =fat_directory_directory) then
           begin
-           temppath:=genfs_search_for_path(fs,basedir+'/'+tempstr,
-           (Pfat_directory_structure(@detectcontent)^.directoryfirstclusterhighword shl 16+
-           Pfat_directory_structure(@detectcontent)^.directoryfirstclusterlowword-2)*
-           fs.fat12.header.head.bpb_SectorPerCluster*fs.fat12.header.head.bpb_bytesPerSector);
-           for i:=1 to temppath.Count do
-            begin
-             inc(Result.Count);
-             SetLength(Result.FilePath,Result.count);
-             SetLength(Result.FileOffset,Result.count);
-             SetLength(Result.FileClass,Result.count);
-             SetLength(Result.FileDirSize,Result.count);
-             SetLength(Result.FileShortStr,Result.Count);
-             SetLength(Result.FileIsShort,Result.count);
-             Result.FilePath[Result.count-1]:=temppath.FilePath[i-1];
-             Result.FileOffset[Result.count-1]:=temppath.FileOffset[i-1];
-             Result.FileClass[Result.count-1]:=temppath.FileClass[i-1];
-             Result.FileDirSize[Result.count-1]:=temppath.FileDirSize[i-1];
-             Result.FileShortStr[Result.Count-1]:=temppath.FileShortStr[i-1];
-             Result.FileIsShort[Result.count-1]:=true;
-            end;
-          end;
-         if(fatstr.unicodefncount>0) then
+           SearchMainPos:=Pfat_directory_structure(@unitcontent)^.directoryfirstclusterhighword shl 16+
+           Pfat_directory_structure(@unitcontent)^.directoryfirstclusterlowword;
+           SearchSubPos:=0;
+           inc(temppathstrindex);
+          end
+         else if(temppathstr.path[temppathstrindex-1]=tempstr)
+         and(fat_get_file_class(Pfat_directory_structure(@unitcontent)^.directoryattribute,false)
+         =fat_directory_file) and (temppathstrindex=temppathstr.count) then
           begin
-           FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+           inc(Result.Count);
+           {Files in FAT12 File System are always short name,Record it.}
+           SetLength(Result.FileShortStr,Result.Count);
+           Result.FileShortStr[Result.count-1]:=
+           genfs_fat_extract_short_name(Pfat_directory_structure(@unitcontent)^);
+           {Record the File Class of Files}
+           SetLength(Result.FileClass,Result.Count);
+           Result.FileClass[Result.count-1]:=
+           fat_get_file_class(Pfat_directory_structure(@unitcontent)^.directoryattribute,false);
+           {Record the File Full Path}
+           SetLength(Result.FilePath,Result.count);
+           fat_MoveDirStructStringToFatString(Pfat_directory_structure(@unitcontent)^,fatstr);
+           tempstr:=fat_FatStringToPWideChar(fatstr);
+           Result.FilePath[Result.count-1]:=basedir;
+           FreeMem(tempstr);
+           {Record the File Main Position(in cluster) and Sub Position(in number of
+           fat_directory_structure)}
+           SetLength(Result.FileMainPos,Result.count);
+           Result.FileMainPos[Result.count-1]:=SearchMainPos;
+           SetLength(Result.FileSubPos,Result.count);
+           Result.FileSubPos[Result.count-1]:=SearchSubPos;
+           break;
           end;
          FreeMem(tempstr);
         end;
-       inc(offset,sizeof(fat_directory_structure));
-       tempnum:=offset div (fs.fat12.header.head.bpb_bytesPerSector*
-       fs.fat12.header.head.bpb_SectorPerCluster)+2;
-       tempnum2:=(offset-sizeof(fat_directory_structure)) div (fs.fat12.header.head.bpb_bytesPerSector*
-       fs.fat12.header.head.bpb_SectorPerCluster)+2;
-       if(tempnum>tempnum2) then
+       if(SearchSubPos=BytePerSector*SectorPerCluster shr 5) then
         begin
-         ii1:=tempnum2 shr 1; ii2:=tempnum2 mod 2;
-         if(ii2=0) then
+         clustervalue:=genfs_fat_read_entry(fs,SearchMainPos);
+         if(fat12_check_cluster_status(clustervalue.entry12)=fat_end)
+         or(fat12_check_cluster_status(clustervalue.entry12)=fat_cluster_broken)then
           begin
-           if(fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry1)<>fat_using) then break
-           else offset:=
-           ((fs.fat12.entrypair+ii1)^.entry12.entry1-2)
-           *fs.fat12.header.head.bpb_bytesPerSector*fs.fat12.header.head.bpb_SectorPerCluster;
+           break;
           end
-         else if(ii2=1) then
+         else if(fat12_check_cluster_status(clustervalue.entry12)<>fat_end)
+         and(fat12_check_cluster_status(clustervalue.entry12)<>fat_cluster_broken)then
           begin
-           if(fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry2)<>fat_using) then break
-           else offset:=
-           ((fs.fat12.entrypair+ii1)^.entry12.entry2-2)
-           *fs.fat12.header.head.bpb_bytesPerSector*fs.fat12.header.head.bpb_SectorPerCluster;
+           SearchMainPos:=clustervalue.entry12;
+           SearchSubPos:=0;
+          end;
+        end;
+      end;
+     if(temppathstrindex<=temppath.Count) then exit(Result);
+     {Then Search into the basedir pointed directory.}
+     while(True)do
+      begin
+       genfs_io_read(fs,unitcontent,fs.fat12.datastart+(SearchMainPos-2)
+       *BytePerSector*SectorPerCluster+
+       SearchSubPos*sizeof(fat_directory_structure),sizeof(fat_directory_structure));
+       inc(SearchSubPos);
+       if(unitcontent[1]=$00) then
+        begin
+         {Indicate the Directory is ended,exit the search.}
+         break;
+        end
+       else if(unitcontent[1]<>$E5) and (unitcontent[12]<>fat_attribute_long_name) then
+        begin
+         inc(Result.Count);
+         {Files in FAT12 File System are always short name,Record it.}
+         SetLength(Result.FileShortStr,Result.Count);
+         Result.FileShortStr[Result.count-1]:=
+         genfs_fat_extract_short_name(Pfat_directory_structure(@unitcontent)^);
+         {Record the File Class of Files}
+         SetLength(Result.FileClass,Result.Count);
+         Result.FileClass[Result.count-1]:=
+         fat_get_file_class(Pfat_directory_structure(@unitcontent)^.directoryattribute,false);
+         {Record the File Full Path}
+         SetLength(Result.FilePath,Result.count);
+         fat_MoveDirStructStringToFatString(Pfat_directory_structure(@unitcontent)^,fatstr);
+         tempstr:=fat_FatStringToPWideChar(fatstr);
+         Result.FilePath[Result.count-1]:=basedir+'/'+tempstr;
+         {Record the File Main Position(in cluster) and Sub Position(in number of
+         fat_directory_structure)}
+         SetLength(Result.FileMainPos,Result.count);
+         Result.FileMainPos[Result.count-1]:=SearchMainPos;
+         SetLength(Result.FileSubPos,Result.count);
+         Result.FileSubPos[Result.count-1]:=SearchSubPos-1;
+         {If the file is directory,then search for this directory}
+         if(UnicodeString(tempstr)='.') and (UnicodeString(tempstr)='..') then
+         inc(Result.FilePrevNextCount);
+         if(UnicodeString(tempstr)<>'.') and (UnicodeString(tempstr)<>'..') and
+         (Result.FileClass[Result.count-1]=fat_directory_directory) then
+          begin
+           {Confirm the position of Directory Content(in cluster}
+           tempdirpos:=Pfat_directory_structure(@unitcontent)^.directoryfirstclusterhighword shl 16+
+           Pfat_directory_structure(@unitcontent)^.directoryfirstclusterlowword;
+           temppath:=genfs_filesystem_search_for_path(fs,
+           Result.FilePath[Result.count-1],tempdirpos);
+           {Insert the temppath's content to main Result}
+           for i:=1 to temppath.Count do
+            begin
+             inc(Result.count);
+             SetLength(Result.FilePath,Result.count);
+             Result.FilePath[Result.count-1]:=temppath.FilePath[i-1];
+             SetLength(Result.FileShortStr,Result.count);
+             Result.FileShortStr[Result.count-1]:=temppath.FileShortStr[i-1];
+             SetLength(Result.FileMainPos,Result.count);
+             Result.FileMainPos[Result.count-1]:=temppath.FileMainPos[i-1];
+             SetLength(Result.FileSubPos,Result.count);
+             Result.FileSubPos[Result.count-1]:=temppath.FileSubPos[i-1];
+             SetLength(Result.FileClass,Result.count);
+             Result.FileClass[Result.count-1]:=temppath.FileClass[i-1];
+            end;
+           {Release the memory of variable temppath}
+           SetLength(temppath.FilePath,0);
+           SetLength(temppath.FileShortStr,0);
+           SetLength(temppath.FileMainPos,0);
+           SetLength(temppath.FileSubPos,0);
+           SetLength(temppath.FileClass,0);
+          end;
+         FreeMem(tempstr);
+        end;
+       {If the read offset is on the boundary of the cluster,go to next cluster or search ended.}
+       if(SearchSubPos=BytePerSector*SectorPerCluster shr 5) then
+        begin
+         clustervalue:=genfs_fat_read_entry(fs,SearchMainPos);
+         if(fat12_check_cluster_status(clustervalue.entry12)=fat_end)
+         or(fat12_check_cluster_status(clustervalue.entry12)=fat_cluster_broken)then
+          begin
+           break;
+          end
+         else if(fat12_check_cluster_status(clustervalue.entry12)<>fat_end)
+         and(fat12_check_cluster_status(clustervalue.entry12)<>fat_cluster_broken)then
+          begin
+           SearchMainPos:=clustervalue.entry12;
+           SearchSubPos:=0;
           end;
         end;
       end;
@@ -1217,507 +1391,633 @@ begin
   end
  else if(fs.fsname=filesystem_fat16) then
   begin
-   if(basedir='/') or (basedir='\') then
+   {Regain the FAT16 Information}
+   BytePerSector:=fs.fat16.header.head.bpb_bytesPerSector;
+   SectorPerCluster:=fs.fat16.header.head.bpb_SectorPerCluster;
+   if(startpos>2) or (basedir='/') or (basedir='\') then
     begin
-     offset:=0; fatstr.unicodefn:=nil; fatstr.unicodefncount:=0; bool:=false;
+     if(startpos>2) then
+      begin
+       {Indicate the Search Pos is a recursion from root directory}
+       SearchMainPos:=startpos; SearchSubPos:=0;
+      end
+     else
+      begin
+       {Indicate the Search Pos is on the root directory}
+       SearchMainPos:=2; SearchSubPos:=0;
+      end;
      while(True)do
       begin
-       genfs_io_read(fs,detectcontent,fs.fat16.datastart+offset,sizeof(fat_directory_structure));
-       if(detectcontent[1]=$00) then
+       genfs_io_read(fs,unitcontent,fs.fat16.datastart+(SearchMainPos-2)
+       *BytePerSector*SectorPerCluster+
+       SearchSubPos*sizeof(fat_directory_structure),sizeof(fat_directory_structure));
+       inc(SearchSubPos);
+       if(unitcontent[1]=$00) then
         begin
-         if(fatstr.unicodefn<>nil) then
-          begin
-           FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-          end;
+         {Indicate the Directory is ended,exit the search.}
          break;
         end
-       else
+       else if(unitcontent[1]<>$E5) and (unitcontent[16]<>fat_attribute_long_name) then
         begin
          inc(Result.Count);
-         SetLength(Result.FileFree,Result.count);
-         Result.FileFree[Result.count-1]:=detectcontent[1]=$E5;
-         SetLength(Result.FilePath,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FilePath[Result.count-1]:=basedir+tempstr
-         else Result.FilePath[Result.count-1]:='';
-         SetLength(Result.FileIsShort,Result.Count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FileIsShort[Result.count-1]:=true
-         else Result.FileIsShort[Result.count-1]:=false;
-         SetLength(Result.FileShortStr,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
+         {Files in FAT16 File System are always short name,Record it.}
+         SetLength(Result.FileShortStr,Result.Count);
          Result.FileShortStr[Result.count-1]:=
-         genfs_fat_extract_short_name(Pfat_directory_structure(@detectcontent)^)
-         else Result.FileShortStr[Result.count-1]:='';
-         SetLength(Result.FileOffset,Result.count);
-         Result.FileOffset[Result.count-1]:=offset;
-         SetLength(Result.FileClass,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
+         genfs_fat_extract_short_name(Pfat_directory_structure(@unitcontent)^);
+         {Record the File Class of Files}
+         SetLength(Result.FileClass,Result.Count);
          Result.FileClass[Result.count-1]:=
-         fat_is_file(Pfat_directory_structure(@detectcontent)^.directoryattribute)
+         fat_get_file_class(Pfat_directory_structure(@unitcontent)^.directoryattribute,false);
+         {Record the File Full Path}
+         SetLength(Result.FilePath,Result.count);
+         fat_MoveDirStructStringToFatString(Pfat_directory_structure(@unitcontent)^,fatstr);
+         tempstr:=fat_FatStringToPWideChar(fatstr);
+         if(basedir='\') or (basedir='/') then
+         Result.FilePath[Result.count-1]:=basedir+tempstr
          else
-         Result.FileClass[Result.count-1]:=0;
-         SetLength(Result.FileDirSize,Result.count);
-         Result.FileDirSize[Result.count-1]:=sizeof(fat_directory_structure);
-         if(Result.FileClass[Result.count-1]=fat_directory_directory)
-         and(UnicodeString(tempstr)<>'..') and (UnicodeString(tempstr)<>'.') and (subdir) then
+         Result.FilePath[Result.count-1]:=basedir+'/'+tempstr;
+         {Record the File Main Position(in cluster) and Sub Position(in number of
+         fat_directory_structure)}
+         SetLength(Result.FileMainPos,Result.count);
+         Result.FileMainPos[Result.count-1]:=SearchMainPos;
+         SetLength(Result.FileSubPos,Result.count);
+         Result.FileSubPos[Result.count-1]:=SearchSubPos-1;
+         {If the file is directory,then search for this directory}
+         if(UnicodeString(tempstr)='.') and (UnicodeString(tempstr)='..') then
+         inc(Result.FilePrevNextCount);
+         if(UnicodeString(tempstr)<>'.') and (UnicodeString(tempstr)<>'..') and
+         (Result.FileClass[Result.count-1]=fat_directory_directory) then
           begin
-           temppath:=genfs_search_for_path(fs,basedir+tempstr,
-           (Pfat_directory_structure(@detectcontent)^.directoryfirstclusterhighword shl 16+
-           Pfat_directory_structure(@detectcontent)^.directoryfirstclusterlowword-2)*
-           fs.fat16.header.head.bpb_SectorPerCluster*fs.fat16.header.head.bpb_bytesPerSector);
+           {Confirm the position of Directory Content(in cluster}
+           tempdirpos:=Pfat_directory_structure(@unitcontent)^.directoryfirstclusterhighword shl 16+
+           Pfat_directory_structure(@unitcontent)^.directoryfirstclusterlowword;
+           temppath:=genfs_filesystem_search_for_path(fs,
+           Result.FilePath[Result.count-1],tempdirpos);
+           {Insert the temppath's content to main Result}
            for i:=1 to temppath.Count do
             begin
-             inc(Result.Count);
+             inc(Result.count);
              SetLength(Result.FilePath,Result.count);
-             SetLength(Result.FileOffset,Result.count);
-             SetLength(Result.FileClass,Result.count);
-             SetLength(Result.FileDirSize,Result.count);
-             SetLength(Result.FileShortStr,Result.Count);
-             SetLength(Result.FileIsShort,Result.count);
              Result.FilePath[Result.count-1]:=temppath.FilePath[i-1];
-             Result.FileOffset[Result.count-1]:=temppath.FileOffset[i-1];
+             SetLength(Result.FileShortStr,Result.count);
+             Result.FileShortStr[Result.count-1]:=temppath.FileShortStr[i-1];
+             SetLength(Result.FileMainPos,Result.count);
+             Result.FileMainPos[Result.count-1]:=temppath.FileMainPos[i-1];
+             SetLength(Result.FileSubPos,Result.count);
+             Result.FileSubPos[Result.count-1]:=temppath.FileSubPos[i-1];
+             SetLength(Result.FileClass,Result.count);
              Result.FileClass[Result.count-1]:=temppath.FileClass[i-1];
-             Result.FileDirSize[Result.count-1]:=temppath.FileDirSize[i-1];
-             Result.FileShortStr[Result.Count-1]:=temppath.FileShortStr[i-1];
-             Result.FileIsShort[Result.count-1]:=true;
             end;
+           {Release the memory of variable temppath}
+           SetLength(temppath.FilePath,0);
+           SetLength(temppath.FileShortStr,0);
+           SetLength(temppath.FileMainPos,0);
+           SetLength(temppath.FileSubPos,0);
+           SetLength(temppath.FileClass,0);
           end;
         end;
-       inc(offset,sizeof(fat_directory_structure));
-       tempnum:=offset div (fs.fat16.header.head.bpb_bytesPerSector*
-       fs.fat16.header.head.bpb_SectorPerCluster)+2;
-       tempnum2:=(offset-sizeof(fat_directory_structure)) div (fs.fat16.header.head.bpb_bytesPerSector*
-       fs.fat16.header.head.bpb_SectorPerCluster)+2;
-       if(tempnum>tempnum2) then
+       FreeMem(tempstr);
+       {If the read offset is on the boundary of the cluster,go to next cluster or search ended.}
+       if(SearchSubPos=BytePerSector*SectorPerCluster shr 5) then
         begin
-         ii1:=tempnum2 shr 1; ii2:=tempnum mod 2;
-         if(fat16_check_cluster_status((fs.fat16.entrypair+ii1)^.entry16[ii2+1])<>fat_using) then break
-         else offset:=((fs.fat16.entrypair+ii1)^.entry16[ii2+1]-2)
-         *fs.fat16.header.head.bpb_bytesPerSector*fs.fat16.header.head.bpb_SectorPerCluster;
+         clustervalue:=genfs_fat_read_entry(fs,SearchMainPos);
+         if(fat16_check_cluster_status(clustervalue.entry16)=fat_end)
+         or(fat16_check_cluster_status(clustervalue.entry16)=fat_cluster_broken)then
+          begin
+           break;
+          end
+         else if(fat16_check_cluster_status(clustervalue.entry16)<>fat_end)
+         and(fat16_check_cluster_status(clustervalue.entry16)<>fat_cluster_broken)then
+          begin
+           SearchMainPos:=clustervalue.entry16;
+           SearchSubPos:=0;
+          end;
         end;
       end;
     end
-   else
+   else if(startpos<=2) then
     begin
-     if(startoffset=0) then
-      begin
-       offset:=0; index:=1;
-       pathstr:=genfs_path_to_path_string(basedir); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-       while(index<=pathstr.count)do
-        begin
-         genfs_io_read(fs,detectcontent,fs.fat16.datastart+offset,sizeof(fat_directory_structure));
-         if(detectcontent[1]=$00) and (bool=false) then
-          begin
-           if(fatstr.unicodefn<>nil) then
-            begin
-             FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-            end;
-           break;
-          end
-         else
-          begin
-           fat_MoveDirStructStringToFatString(Pfat_directory_structure(@detectcontent)^,fatstr);
-           tempstr:=fat_FatStringToPWideChar(fatstr);
-           if(UnicodeString(tempstr)<>'..') and (UnicodeString(tempstr)<>'.')
-           and(fat_is_file(Pfat_directory_structure(@detectcontent)^.directoryattribute)
-           =fat_directory_directory) and (tempstr=pathstr.path[index-1]) then
-            begin
-             offset:=(Pfat_directory_structure(@detectcontent)^.directoryfirstclusterhighword shl 16
-             +Pfat_directory_structure(@detectcontent)^.directoryfirstclusterlowword-2)*
-             fs.fat16.header.head.bpb_SectorPerCluster*fs.fat16.header.head.bpb_bytesPerSector;
-             inc(index);
-             if(fatstr.unicodefncount>0) then
-              begin
-               FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-              end;
-             FreeMem(tempstr);
-             continue;
-            end;
-           if(fatstr.unicodefncount>0) then
-            begin
-             FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-            end;
-           FreeMem(tempstr);
-          end;
-         inc(offset,sizeof(fat_directory_structure));
-         tempnum:=offset div (fs.fat16.header.head.bpb_bytesPerSector*
-         fs.fat16.header.head.bpb_SectorPerCluster)+2;
-         tempnum2:=(offset-sizeof(fat_directory_structure)) div (fs.fat16.header.head.bpb_bytesPerSector*
-         fs.fat16.header.head.bpb_SectorPerCluster)+2;
-         if(tempnum>tempnum2) then
-          begin
-           if(tempnum>tempnum2) then
-            begin
-             ii1:=tempnum2 shr 1; ii2:=tempnum mod 2;
-             if(fat16_check_cluster_status((fs.fat16.entrypair+ii1)^.entry16[ii2+1])<>fat_using) then break
-             else offset:=((fs.fat16.entrypair+ii1)^.entry16[ii2+1]-2)
-             *fs.fat16.header.head.bpb_bytesPerSector*fs.fat16.header.head.bpb_SectorPerCluster;
-            end;
-          end;
-        end;
-      end
-     else offset:=startoffset;
-     fatstr.unicodefn:=nil; fatstr.unicodefncount:=0; bool:=false;
+     {Indicate the basedir is not root directory or recurse from root directory.}
+     SearchMainPos:=2; SearchSubPos:=0;
+     temppathstrindex:=1; temppathstr:=genfs_path_to_path_string(basedir);
+     {Go to the basedir pointed directory.}
      while(True)do
       begin
-       tempnum:=offset div (fs.fat16.header.head.bpb_bytesPerSector*
-       fs.fat16.header.head.bpb_SectorPerCluster)+2;
-       ii1:=tempnum shr 1; ii2:=tempnum mod 2;
-       if(fat16_check_cluster_status((fs.fat16.entrypair+ii1)^.entry16[ii2+1])=fat_available) then break;
-       genfs_io_read(fs,detectcontent,fs.fat16.datastart+offset,sizeof(fat_directory_structure));
-       if(detectcontent[1]=$00) then
+       genfs_io_read(fs,unitcontent,fs.fat16.datastart+(SearchMainPos-2)*
+       BytePerSector*SectorPerCluster+SearchSubPos*sizeof(fat_directory_structure),
+       sizeof(fat_directory_structure));
+       inc(SearchSubPos);
+       if(unitcontent[1]=$00) then
         begin
-         if(fatstr.unicodefn<>nil) then
-          begin
-           FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-          end;
          break;
         end
-       else
+       else if(unitcontent[1]<>$E5) and (unitcontent[16]<>fat_attribute_long_name) then
         begin
-         inc(Result.Count);
-         SetLength(Result.FileFree,Result.count);
-         Result.FileFree[Result.count-1]:=detectcontent[1]=$E5;
-         SetLength(Result.FilePath,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FilePath[Result.count-1]:=basedir+'/'+tempstr
-         else Result.FilePath[Result.count-1]:='';
-         SetLength(Result.FileIsShort,Result.Count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FileIsShort[Result.count-1]:=true
-         else Result.FileIsShort[Result.count-1]:=false;
-         SetLength(Result.FileShortStr,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FileShortStr[Result.count-1]:=
-         genfs_fat_extract_short_name(Pfat_directory_structure(@detectcontent)^)
-         else Result.FileShortStr[Result.count-1]:='';
-         SetLength(Result.FileOffset,Result.count);
-         Result.FileOffset[Result.count-1]:=offset;
-         SetLength(Result.FileClass,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FileClass[Result.count-1]:=
-         fat_is_file(Pfat_directory_structure(@detectcontent)^.directoryattribute)
-         else
-         Result.FileClass[Result.count-1]:=0;
-         SetLength(Result.FileDirSize,Result.count);
-         Result.FileDirSize[Result.count-1]:=sizeof(fat_directory_structure);
-         if(Result.FileClass[Result.count-1]=fat_directory_directory)
-         and (Pfat_directory_structure(@detectcontent)^.directoryfilesize=0)
-         and (UnicodeString(tempstr)<>'..') and (UnicodeString(tempstr)<>'.') and (subdir) then
+         fat_MoveDirStructStringToFatString(Pfat_directory_structure(@unitcontent)^,fatstr);
+         tempstr:=fat_FatStringToPWideChar(fatstr);
+         if(UnicodeString(tempstr)<>'.') and (UnicodeString(tempstr)<>'..') and
+         (temppathstr.path[temppathstrindex-1]=tempstr)
+         and(fat_get_file_class(Pfat_directory_structure(@unitcontent)^.directoryattribute,false)
+         =fat_directory_directory) then
           begin
-           temppath:=genfs_search_for_path(fs,basedir+'/'+tempstr,
-           (Pfat_directory_structure(@detectcontent)^.directoryfirstclusterhighword shl 16+
-           Pfat_directory_structure(@detectcontent)^.directoryfirstclusterlowword-2)*
-           fs.fat16.header.head.bpb_SectorPerCluster*fs.fat16.header.head.bpb_bytesPerSector);
-           for i:=1 to temppath.Count do
-            begin
-             inc(Result.Count);
-             SetLength(Result.FilePath,Result.count);
-             SetLength(Result.FileOffset,Result.count);
-             SetLength(Result.FileClass,Result.count);
-             SetLength(Result.FileDirSize,Result.count);
-             SetLength(Result.FileShortStr,Result.Count);
-             SetLength(Result.FileIsShort,Result.count);
-             Result.FilePath[Result.count-1]:=temppath.FilePath[i-1];
-             Result.FileOffset[Result.count-1]:=temppath.FileOffset[i-1];
-             Result.FileClass[Result.count-1]:=temppath.FileClass[i-1];
-             Result.FileDirSize[Result.count-1]:=temppath.FileDirSize[i-1];
-             Result.FileShortStr[Result.Count-1]:=temppath.FileShortStr[i-1];
-             Result.FileIsShort[Result.count-1]:=true;
-            end;
+           SearchMainPos:=Pfat_directory_structure(@unitcontent)^.directoryfirstclusterhighword shl 16+
+           Pfat_directory_structure(@unitcontent)^.directoryfirstclusterlowword;
+           SearchSubPos:=0;
+           inc(temppathstrindex);
+          end
+         else if(temppathstr.path[temppathstrindex-1]=tempstr)
+         and(fat_get_file_class(Pfat_directory_structure(@unitcontent)^.directoryattribute,false)
+         =fat_directory_file) and (temppathstrindex=temppathstr.count) then
+          begin
+           inc(Result.Count);
+           {Files in FAT16 File System are always short name,Record it.}
+           SetLength(Result.FileShortStr,Result.Count);
+           Result.FileShortStr[Result.count-1]:=
+           genfs_fat_extract_short_name(Pfat_directory_structure(@unitcontent)^);
+           {Record the File Class of Files}
+           SetLength(Result.FileClass,Result.Count);
+           Result.FileClass[Result.count-1]:=
+           fat_get_file_class(Pfat_directory_structure(@unitcontent)^.directoryattribute,false);
+           {Record the File Full Path}
+           SetLength(Result.FilePath,Result.count);
+           fat_MoveDirStructStringToFatString(Pfat_directory_structure(@unitcontent)^,fatstr);
+           tempstr:=fat_FatStringToPWideChar(fatstr);
+           Result.FilePath[Result.count-1]:=basedir;
+           FreeMem(tempstr);
+           {Record the File Main Position(in cluster) and Sub Position(in number of
+           fat_directory_structure)}
+           SetLength(Result.FileMainPos,Result.count);
+           Result.FileMainPos[Result.count-1]:=SearchMainPos;
+           SetLength(Result.FileSubPos,Result.count);
+           Result.FileSubPos[Result.count-1]:=SearchSubPos;
+           break;
+          end;
+         FreeMem(tempstr);
+        end;
+       if(SearchSubPos=BytePerSector*SectorPerCluster shr 5) then
+        begin
+         clustervalue:=genfs_fat_read_entry(fs,SearchMainPos);
+         if(fat16_check_cluster_status(clustervalue.entry16)=fat_end)
+         or(fat16_check_cluster_status(clustervalue.entry16)=fat_cluster_broken)then
+          begin
+           break;
+          end
+         else if(fat16_check_cluster_status(clustervalue.entry16)<>fat_end)
+         and(fat16_check_cluster_status(clustervalue.entry16)<>fat_cluster_broken)then
+          begin
+           SearchMainPos:=clustervalue.entry16;
+           SearchSubPos:=0;
           end;
         end;
-       inc(offset,sizeof(fat_directory_structure));
-       tempnum:=offset div (fs.fat16.header.head.bpb_bytesPerSector*
-       fs.fat16.header.head.bpb_SectorPerCluster)+2;
-       tempnum2:=(offset-sizeof(fat_directory_structure)) div (fs.fat16.header.head.bpb_bytesPerSector*
-       fs.fat16.header.head.bpb_SectorPerCluster)+2;
-       if(tempnum>tempnum2) then
+      end;
+     if(temppathstrindex<=temppath.Count) then exit(Result);
+     {Then Search into the basedir pointed directory.}
+     while(True)do
+      begin
+       genfs_io_read(fs,unitcontent,fs.fat16.datastart+(SearchMainPos-2)
+       *BytePerSector*SectorPerCluster+
+       SearchSubPos*sizeof(fat_directory_structure),sizeof(fat_directory_structure));
+       inc(SearchSubPos);
+       if(unitcontent[1]=$00) then
         begin
-         ii1:=tempnum2 shr 1; ii2:=tempnum mod 2;
-         if(fat16_check_cluster_status((fs.fat16.entrypair+ii1)^.entry16[ii2+1])<>fat_using) then break
-         else offset:=((fs.fat16.entrypair+ii1)^.entry16[ii2+1]-2)
-         *fs.fat16.header.head.bpb_bytesPerSector*fs.fat16.header.head.bpb_SectorPerCluster;
+         {Indicate the Directory is ended,exit the search.}
+         break;
+        end
+       else if(unitcontent[1]<>$E5) and (unitcontent[16]<>fat_attribute_long_name) then
+        begin
+         inc(Result.Count);
+         {Files in FAT16 File System are always short name,Record it.}
+         SetLength(Result.FileShortStr,Result.Count);
+         Result.FileShortStr[Result.count-1]:=
+         genfs_fat_extract_short_name(Pfat_directory_structure(@unitcontent)^);
+         {Record the File Class of Files}
+         SetLength(Result.FileClass,Result.Count);
+         Result.FileClass[Result.count-1]:=
+         fat_get_file_class(Pfat_directory_structure(@unitcontent)^.directoryattribute,false);
+         {Record the File Full Path}
+         SetLength(Result.FilePath,Result.count);
+         fat_MoveDirStructStringToFatString(Pfat_directory_structure(@unitcontent)^,fatstr);
+         tempstr:=fat_FatStringToPWideChar(fatstr);
+         if(basedir='\') or (basedir='/') then
+         Result.FilePath[Result.count-1]:=basedir+tempstr
+         else
+         Result.FilePath[Result.count-1]:=basedir+'/'+tempstr;
+         {Record the File Main Position(in cluster) and Sub Position(in number of
+         fat_directory_structure)}
+         SetLength(Result.FileMainPos,Result.count);
+         Result.FileMainPos[Result.count-1]:=SearchMainPos;
+         SetLength(Result.FileSubPos,Result.count);
+         Result.FileSubPos[Result.count-1]:=SearchSubPos-1;
+         {If the file is directory,then search for this directory}
+         if(UnicodeString(tempstr)='.') and (UnicodeString(tempstr)='..') then
+         inc(Result.FilePrevNextCount);
+         if(UnicodeString(tempstr)<>'.') and (UnicodeString(tempstr)<>'..') and
+         (Result.FileClass[Result.count-1]=fat_directory_directory) then
+          begin
+           {Confirm the position of Directory Content(in cluster)}
+           tempdirpos:=Pfat_directory_structure(@unitcontent)^.directoryfirstclusterhighword shl 16+
+           Pfat_directory_structure(@unitcontent)^.directoryfirstclusterlowword;
+           temppath:=genfs_filesystem_search_for_path(fs,
+           Result.FilePath[Result.count-1],tempdirpos);
+           {Insert the temppath's content to main Result}
+           for i:=1 to temppath.Count do
+            begin
+             inc(Result.count);
+             SetLength(Result.FilePath,Result.count);
+             Result.FilePath[Result.count-1]:=temppath.FilePath[i-1];
+             SetLength(Result.FileShortStr,Result.count);
+             Result.FileShortStr[Result.count-1]:=temppath.FileShortStr[i-1];
+             SetLength(Result.FileMainPos,Result.count);
+             Result.FileMainPos[Result.count-1]:=temppath.FileMainPos[i-1];
+             SetLength(Result.FileSubPos,Result.count);
+             Result.FileSubPos[Result.count-1]:=temppath.FileSubPos[i-1];
+             SetLength(Result.FileClass,Result.count);
+             Result.FileClass[Result.count-1]:=temppath.FileClass[i-1];
+            end;
+           {Release the memory of variable temppath}
+           SetLength(temppath.FilePath,0);
+           SetLength(temppath.FileShortStr,0);
+           SetLength(temppath.FileMainPos,0);
+           SetLength(temppath.FileSubPos,0);
+           SetLength(temppath.FileClass,0);
+          end;
+        end;
+       FreeMem(tempstr);
+       {If the read offset is on the boundary of the cluster,go to next cluster or search ended.}
+       if(SearchSubPos=BytePerSector*SectorPerCluster shr 5) then
+        begin
+         clustervalue:=genfs_fat_read_entry(fs,SearchMainPos);
+         if(fat16_check_cluster_status(clustervalue.entry16)=fat_end)
+         or(fat16_check_cluster_status(clustervalue.entry16)=fat_cluster_broken)then
+          begin
+           break;
+          end
+         else if(fat16_check_cluster_status(clustervalue.entry16)<>fat_end)
+         and(fat16_check_cluster_status(clustervalue.entry16)<>fat_cluster_broken)then
+          begin
+           SearchMainPos:=clustervalue.entry16;
+           SearchSubPos:=0;
+          end;
         end;
       end;
     end;
   end
  else if(fs.fsname=filesystem_fat32) then
   begin
-   sizerec:=0;
-   if(basedir='/') or (basedir='\') then
+   {Regain the FAT32 Information}
+   BytePerSector:=fs.fat32.header.head.bpb_bytesPerSector;
+   SectorPerCluster:=fs.fat32.header.head.bpb_SectorPerCluster;
+   RootCluster:=fs.fat32.header.exthead.bpb_rootcluster; recindex:=0; startindex:=0;
+   if((startpos>=2) and (startpos<>RootCluster)) or (Basedir='/') or (BaseDir='\') then
     begin
-     offset:=(fs.fat32.header.exthead.bpb_rootcluster-2)*
-     fs.fat32.header.head.bpb_bytesPerSector*fs.fat32.header.head.bpb_SectorPerCluster;
-     fatstr.unicodefn:=nil; fatstr.unicodefncount:=0; bool:=false;
+     if(startpos>=2) and (startpos<>RootCluster) then
+      begin
+       {Indicate it is recursive from root directory.}
+       SearchMainPos:=startpos; SearchSubPos:=0;
+      end
+     else
+      begin
+       {Indicate it is root directory.}
+       SearchMainPos:=RootCluster; SearchSubPos:=0;
+      end;
      while(True)do
       begin
-       genfs_io_read(fs,detectcontent,fs.fat32.datastart+offset,sizeof(fat_directory_structure));
-       if(detectcontent[1]=$00) and (bool=false) then
+       genfs_io_read(fs,unitcontent,fs.fat32.datastart+(SearchMainPos-2)*
+       BytePerSector*SectorPerCluster+SearchSubPos*sizeof(fat_directory_structure),
+       sizeof(fat_directory_structure));
+       inc(SearchSubPos);
+       if(unitcontent[1]=$00) then
         begin
-         if(fatstr.unicodefn<>nil) then
-          begin
-           FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-          end;
+         {Indicate the Directory is ended.}
          break;
         end
-       else if(detectcontent[12]=fat_attribute_long_name) and (detectcontent[1]<>$E5) then
+       else if(unitcontent[12]=fat_attribute_long_name) then
         begin
+         {Add the long directory structure item to Directory.}
          inc(fatstr.unicodefncount);
          ReallocMem(fatstr.unicodefn,sizeof(fat_long_directory_structure)*fatstr.unicodefncount);
-         fat_MoveLongDirStructStringToFatString(Pfat_long_directory_structure(@detectcontent)^,
+         fat_MoveLongDirStructStringToFatString(Pfat_long_directory_structure(@unitcontent)^,
          fatstr,fatstr.unicodefncount);
-         if(sizerec=0) then sizerec:=sizeof(fat_directory_structure)
-         else inc(sizerec,sizeof(fat_long_directory_structure));
-        end
-       else if(detectcontent[12]<>fat_attribute_long_name) then
-        begin
-         fat_MoveDirStructStringToFatString(Pfat_directory_structure(@detectcontent)^,fatstr);
-         tempstr:=fat_FatStringToPWideChar(fatstr);
-         inc(Result.Count);
-         SetLength(Result.FileFree,Result.count);
-         Result.FileFree[Result.count-1]:=detectcontent[1]=$E5;
-         SetLength(Result.FilePath,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FilePath[Result.count-1]:=basedir+tempstr
-         else Result.FilePath[Result.count-1]:='';
-         SetLength(Result.FileIsShort,Result.Count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FileIsShort[Result.count-1]:=fatstr.unicodefncount=0
-         else Result.FileIsShort[Result.count-1]:=false;
-         SetLength(Result.FileShortStr,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FileShortStr[Result.count-1]:=
-         genfs_fat_extract_short_name(Pfat_directory_structure(@detectcontent)^)
-         else Result.FileShortStr[Result.count-1]:='';
-         SetLength(Result.FileOffset,Result.count);
-         Result.FileOffset[Result.count-1]:=offset;
-         SetLength(Result.FileClass,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FileClass[Result.count-1]:=
-         fat_is_file(Pfat_directory_structure(@detectcontent)^.directoryattribute)
-         else
-         Result.FileClass[Result.count-1]:=0;
-         SetLength(Result.FileDirSize,Result.count);
-         if(sizerec=0) then
-         Result.FileDirSize[Result.count-1]:=sizeof(fat_directory_structure)
-         else
-         Result.FileDirSize[Result.Count-1]:=sizerec+sizeof(fat_directory_structure);
-         sizerec:=0;
-         if(Result.FileClass[Result.count-1]=fat_directory_directory)
-         and(UnicodeString(tempstr)<>'..') and (UnicodeString(tempstr)<>'.') and (subdir) then
+         if(recindex=0) then
           begin
-           temppath:=genfs_search_for_path(fs,basedir+tempstr,
-           (Pfat_directory_structure(@detectcontent)^.directoryfirstclusterhighword shl 16+
-           Pfat_directory_structure(@detectcontent)^.directoryfirstclusterlowword-2)*
-           fs.fat32.header.head.bpb_SectorPerCluster*fs.fat32.header.head.bpb_bytesPerSector);
+           startindex:=SearchMainPos; startoffset:=SearchSubPos;
+          end;
+         inc(recindex);
+        end
+       else if(unitcontent[12]<>fat_attribute_long_name) then
+        begin
+         inc(Result.count);
+         {Files in FAT32 are always have short name,record it.}
+         SetLength(Result.FileShortStr,Result.count);
+         Result.FileShortStr[Result.count-1]:=
+         genfs_fat_extract_short_name(Pfat_directory_structure(@unitcontent)^);
+         {Record the File Class of File.}
+         SetLength(Result.FileClass,Result.count);
+         Result.FileClass[Result.count-1]:=
+         fat_get_file_class(Pfat_directory_structure(@unitcontent)^.directoryattribute,recindex>0);
+         {Record the File Full Path}
+         SetLength(Result.FilePath,Result.count);
+         fat_MoveDirStructStringToFatString(Pfat_directory_structure(@unitcontent)^,fatstr);
+         tempstr:=fat_FatStringToPWideChar(fatstr);
+         if(basedir='\') or (basedir='/') then
+         Result.FilePath[Result.count-1]:=basedir+tempstr
+         else
+         Result.FilePath[Result.count-1]:=basedir+'/'+tempstr;
+         {Record the File Main Position(in cluster) and Sub Position(in number of
+         fat_directory_structure)}
+         SetLength(Result.FileMainPos,Result.count);
+         SetLength(Result.FileSubPos,Result.count);
+         if(startindex<>0) then
+          begin
+           Result.FileMainPos[Result.count-1]:=Startindex;
+           Result.FileSubPos[Result.count-1]:=startoffset-1;
+          end
+         else
+          begin
+           Result.FileMainPos[Result.count-1]:=SearchMainPos;
+           Result.FileSubPos[Result.count-1]:=SearchSubPos-1;
+          end;
+         {Record the File Directory's actual size}
+         SetLength(Result.FileStructSize,Result.count);
+         Result.FileStructSize[Result.count-1]:=recindex+1;
+         {If the file is directory,then search into its content}
+         if(UnicodeString(tempstr)='.') and (UnicodeString(tempstr)='..') then
+         inc(Result.FilePrevNextCount);
+         if(UnicodeString(tempstr)<>'.') and (UnicodeString(tempstr)<>'..') and
+         (Result.FileClass[Result.count-1] and fat_directory_directory=fat_directory_directory) then
+          begin
+           {Confirm the position of Directory Content(in cluster)}
+           tempdirpos:=Pfat_directory_structure(@unitcontent)^.directoryfirstclusterhighword shl 16+
+           Pfat_directory_structure(@unitcontent)^.directoryfirstclusterlowword;
+           temppath:=genfs_filesystem_search_for_path(fs,
+           Result.FilePath[Result.count-1],tempdirpos);
+           {Insert the temppath's content to main Result}
            for i:=1 to temppath.Count do
             begin
-             inc(Result.Count);
+             inc(Result.count);
              SetLength(Result.FilePath,Result.count);
-             SetLength(Result.FileOffset,Result.count);
-             SetLength(Result.FileClass,Result.count);
-             SetLength(Result.FileDirSize,Result.count);
-             SetLength(Result.FileShortStr,Result.Count);
-             SetLength(Result.FileIsShort,Result.count);
              Result.FilePath[Result.count-1]:=temppath.FilePath[i-1];
-             Result.FileOffset[Result.count-1]:=temppath.FileOffset[i-1];
+             SetLength(Result.FileShortStr,Result.count);
+             Result.FileShortStr[Result.count-1]:=temppath.FileShortStr[i-1];
+             SetLength(Result.FileMainPos,Result.count);
+             Result.FileMainPos[Result.count-1]:=temppath.FileMainPos[i-1];
+             SetLength(Result.FileSubPos,Result.count);
+             Result.FileSubPos[Result.count-1]:=temppath.FileSubPos[i-1];
+             SetLength(Result.FileClass,Result.count);
              Result.FileClass[Result.count-1]:=temppath.FileClass[i-1];
-             Result.FileDirSize[Result.count-1]:=temppath.FileDirSize[i-1];
-             Result.FileShortStr[Result.Count-1]:=temppath.FileShortStr[i-1];
-             Result.FileIsShort[Result.count-1]:=temppath.FileIsShort[i-1];
+             SetLength(Result.FileStructSize,Result.count);
+             Result.FileStructSize[Result.count-1]:=temppath.FileClass[i-1];
             end;
+           {Release the memory of variable temppath}
+           SetLength(temppath.FilePath,0);
+           SetLength(temppath.FileShortStr,0);
+           SetLength(temppath.FileMainPos,0);
+           SetLength(temppath.FileSubPos,0);
+           SetLength(temppath.FileClass,0);
+           SetLength(temppath.FileStructSize,0);
           end;
-         FreeMem(tempstr);
-         if(fatstr.unicodefn<>nil) then
+         if(fatstr.unicodefncount>0) then
           begin
            FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
           end;
-         bool:=false;
+         recindex:=0; startindex:=0; startoffset:=0;
+         FreeMem(tempstr);
         end;
-       inc(offset,sizeof(fat_directory_structure));
-       tempnum:=offset div (fs.fat32.header.head.bpb_bytesPerSector*
-       fs.fat32.header.head.bpb_SectorPerCluster)+2;
-       tempnum2:=(offset-sizeof(fat_directory_structure)) div (fs.fat32.header.head.bpb_bytesPerSector*
-       fs.fat32.header.head.bpb_SectorPerCluster)+2;
-       if(tempnum>tempnum2) then
+       {If the read offset is on the boundary of the cluster,go to next cluster or search ended.}
+       if(SearchSubPos=BytePerSector*SectorPerCluster shr 5) then
         begin
-         ii1:=tempnum2 shr 1; ii2:=tempnum mod 2;
-         if(fat32_check_cluster_status((fs.fat32.entrypair+ii1)^.entry32[ii2+1])<>fat_using) then break
-         else offset:=((fs.fat32.entrypair+ii1)^.entry32[ii2+1]-2)
-         *fs.fat32.header.head.bpb_bytesPerSector*fs.fat32.header.head.bpb_SectorPerCluster;
+         clustervalue:=genfs_fat_read_entry(fs,SearchMainPos);
+         if(fat32_check_cluster_status(clustervalue.entry32)=fat_end)
+         or(fat32_check_cluster_status(clustervalue.entry32)=fat_cluster_broken)then
+          begin
+           break;
+          end
+         else if(fat32_check_cluster_status(clustervalue.entry32)<>fat_end)
+         and(fat32_check_cluster_status(clustervalue.entry32)<>fat_cluster_broken)then
+          begin
+           SearchMainPos:=clustervalue.entry32;
+           SearchSubPos:=0;
+          end;
         end;
       end;
     end
-   else
+   else if(startpos<2) then
     begin
-     if(startoffset=fs.fat32.header.head.bpb_bytesPerSector*
-     fs.fat32.header.head.bpb_SectorPerCluster*(fs.fat32.header.exthead.bpb_rootcluster-2))
-     or (startoffset=0) then
-      begin
-       offset:=fs.fat32.header.head.bpb_bytesPerSector*
-       fs.fat32.header.head.bpb_SectorPerCluster*(fs.fat32.header.exthead.bpb_rootcluster-2); index:=1;
-       pathstr:=genfs_path_to_path_string(basedir);
-       fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-       while(index<=pathstr.count)do
-        begin
-         genfs_io_read(fs,detectcontent,fs.fat32.datastart+offset,sizeof(fat_directory_structure));
-         if(detectcontent[1]=$00) and (bool=false) then
-          begin
-           if(fatstr.unicodefn<>nil) then
-            begin
-             FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-            end;
-           break;
-          end
-         else if(detectcontent[12]=fat_attribute_long_name) and (detectcontent[1]<>$E5) then
-          begin
-           inc(fatstr.unicodefncount);
-           ReallocMem(fatstr.unicodefn,sizeof(fat_long_directory_structure)*fatstr.unicodefncount);
-           fat_MoveLongDirStructStringToFatString(Pfat_long_directory_structure(@detectcontent)^,
-           fatstr,fatstr.unicodefncount);
-           if(sizerec=0) then sizerec:=sizeof(fat_directory_structure)
-           else inc(sizerec,sizeof(fat_long_directory_structure));
-          end
-         else if(detectcontent[12]<>fat_attribute_long_name) then
-          begin
-           fat_MoveDirStructStringToFatString(Pfat_directory_structure(@detectcontent)^,fatstr);
-           tempstr:=fat_FatStringToPWideChar(fatstr);
-           if(fat_is_file(Pfat_directory_structure(@detectcontent)^.directoryattribute)=
-           fat_directory_directory)
-           and (UnicodeString(tempstr)<>'..') and (UnicodeString(tempstr)<>'.') then
-            begin
-             offset:=(Pfat_directory_structure(@detectcontent)^.directoryfirstclusterhighword shl 16
-             +Pfat_directory_structure(@detectcontent)^.directoryfirstclusterlowword-2)*
-             fs.fat32.header.head.bpb_SectorPerCluster*fs.fat32.header.head.bpb_bytesPerSector;
-             inc(index);
-             if(fatstr.unicodefncount>0) then
-              begin
-               FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-              end;
-             FreeMem(tempstr);
-             continue;
-            end;
-           if(fatstr.unicodefncount>0) then
-            begin
-             FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-            end;
-           FreeMem(tempstr);
-          end;
-         inc(offset,sizeof(fat_directory_structure));
-         tempnum:=offset div (fs.fat32.header.head.bpb_bytesPerSector*
-         fs.fat32.header.head.bpb_SectorPerCluster)+2;
-         tempnum2:=(offset-sizeof(fat_directory_structure)) div (fs.fat32.header.head.bpb_bytesPerSector*
-         fs.fat32.header.head.bpb_SectorPerCluster)+2;
-         if(tempnum>tempnum2) then
-          begin
-           ii1:=tempnum2 shr 1; ii2:=tempnum mod 2;
-           if(fat32_check_cluster_status((fs.fat32.entrypair+ii1)^.entry32[ii2+1])<>fat_using) then break
-           else offset:=((fs.fat32.entrypair+ii1)^.entry32[ii2+1]-2)
-           *fs.fat32.header.head.bpb_bytesPerSector*fs.fat32.header.head.bpb_SectorPerCluster;
-          end;
-        end;
-      end
-     else offset:=startoffset;
-     fatstr.unicodefn:=nil; fatstr.unicodefncount:=0; bool:=false;
+     {Indicate the basedir is not root directory or recurse from root directory.}
+     SearchMainPos:=RootCluster; SearchSubPos:=0;
+     temppathstrindex:=1; temppathstr:=genfs_path_to_path_string(basedir);
+     {Go to the basedir pointed directory.}
      while(True)do
       begin
-       genfs_io_read(fs,detectcontent,fs.fat32.datastart+offset,sizeof(fat_directory_structure));
-       if(detectcontent[1]=$00) and (bool=false) then
+       genfs_io_read(fs,unitcontent,fs.fat32.datastart+(SearchMainPos-2)*
+       BytePerSector*SectorPerCluster+SearchSubPos*sizeof(fat_directory_structure),
+       sizeof(fat_directory_structure));
+       inc(SearchSubPos);
+       if(unitcontent[1]=$00) then
         begin
-         if(fatstr.unicodefn<>nil) then
-          begin
-           FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-          end;
+         {Indicate the Directory is ended.}
          break;
         end
-       else if(detectcontent[12]=fat_attribute_long_name) and (detectcontent[1]<>$E5) then
+       else if(unitcontent[12]=fat_attribute_long_name) then
         begin
          inc(fatstr.unicodefncount);
          ReallocMem(fatstr.unicodefn,sizeof(fat_long_directory_structure)*fatstr.unicodefncount);
-         fat_MoveLongDirStructStringToFatString(Pfat_long_directory_structure(@detectcontent)^,
+         fat_MoveLongDirStructStringToFatString(Pfat_long_directory_structure(@unitcontent)^,
          fatstr,fatstr.unicodefncount);
-         if(sizerec=0) then sizerec:=sizeof(fat_directory_structure)
-         else inc(sizerec,sizeof(fat_long_directory_structure));
-        end
-       else if(detectcontent[12]<>fat_attribute_long_name) then
-        begin
-         fat_MoveDirStructStringToFatString(Pfat_directory_structure(@detectcontent)^,fatstr);
-         tempstr:=fat_FatStringToPWideChar(fatstr);
-         inc(Result.Count);
-         SetLength(Result.FileFree,Result.count);
-         Result.FileFree[Result.count-1]:=detectcontent[1]=$E5;
-         SetLength(Result.FilePath,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FilePath[Result.count-1]:=basedir+'/'+tempstr
-         else Result.FilePath[Result.count-1]:='';
-         SetLength(Result.FileIsShort,Result.Count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FileIsShort[Result.count-1]:=fatstr.unicodefncount=0
-         else Result.FileIsShort[Result.count-1]:=false;
-         SetLength(Result.FileShortStr,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FileShortStr[Result.count-1]:=
-         genfs_fat_extract_short_name(Pfat_directory_structure(@detectcontent)^)
-         else Result.FileShortStr[Result.count-1]:='';
-         SetLength(Result.FileOffset,Result.count);
-         Result.FileOffset[Result.count-1]:=offset;
-         SetLength(Result.FileClass,Result.count);
-         if(Result.FileFree[Result.count-1]=false) then
-         Result.FileClass[Result.count-1]:=
-         fat_is_file(Pfat_directory_structure(@detectcontent)^.directoryattribute)
-         else
-         Result.FileClass[Result.count-1]:=0;
-         SetLength(Result.FileDirSize,Result.count);
-         if(sizerec=0) then
-         Result.FileDirSize[Result.count-1]:=sizeof(fat_directory_structure)
-         else
-         Result.FileDirSize[Result.Count-1]:=sizerec+sizeof(fat_directory_structure);
-         sizerec:=0;
-         if(Result.FileClass[Result.count-1]=fat_directory_directory)
-         and (Pfat_directory_structure(@detectcontent)^.directoryfilesize=0)
-         and (UnicodeString(tempstr)<>'..') and (UnicodeString(tempstr)<>'.') and (subdir) then
+         if(recindex=0) then
           begin
-           temppath:=genfs_search_for_path(fs,basedir+'/'+tempstr,
-           (Pfat_directory_structure(@detectcontent)^.directoryfirstclusterhighword shl 16+
-           Pfat_directory_structure(@detectcontent)^.directoryfirstclusterlowword-2)*
-           fs.fat32.header.head.bpb_SectorPerCluster*fs.fat32.header.head.bpb_bytesPerSector);
-           for i:=1 to temppath.Count do
-            begin
-             inc(Result.Count);
-             SetLength(Result.FilePath,Result.count);
-             SetLength(Result.FileOffset,Result.count);
-             SetLength(Result.FileClass,Result.count);
-             SetLength(Result.FileDirSize,Result.count);
-             SetLength(Result.FileShortStr,Result.Count);
-             SetLength(Result.FileIsShort,Result.count);
-             Result.FilePath[Result.count-1]:=temppath.FilePath[i-1];
-             Result.FileOffset[Result.count-1]:=temppath.FileOffset[i-1];
-             Result.FileClass[Result.count-1]:=temppath.FileClass[i-1];
-             Result.FileDirSize[Result.count-1]:=temppath.FileDirSize[i-1];
-             Result.FileShortStr[Result.Count-1]:=temppath.FileShortStr[i-1];
-             Result.FileIsShort[Result.count-1]:=temppath.FileIsShort[i-1];
-            end;
+           startindex:=SearchMainPos; startoffset:=SearchSubPos;
           end;
-         FreeMem(tempstr);
-         if(fatstr.unicodefn<>nil) then
+         inc(recindex);
+        end
+       else if(unitcontent[12]<>fat_attribute_long_name) then
+        begin
+         fat_MoveDirStructStringToFatString(Pfat_directory_structure(@unitcontent)^,fatstr);
+         tempstr:=fat_FatStringToPWideChar(fatstr);
+         if(UnicodeString(tempstr)<>'.') and (UnicodeString(tempstr)<>'..') and
+         (temppathstr.path[temppathstrindex-1]=tempstr) and
+         (fat_get_file_class(Pfat_directory_structure(@unitcontent)^.directoryattribute,recindex>0)
+         and fat_directory_directory=fat_directory_directory) then
+          begin
+           SearchMainPos:=Pfat_directory_structure(@unitcontent)^.directoryfirstclusterhighword shl 16
+           +Pfat_directory_structure(@unitcontent)^.directoryfirstclusterlowword;
+           SearchSubPos:=0;
+           if(recindex=0) then startindex:=SearchSubPos;
+           inc(temppathstrindex);
+          end
+         else if(temppathstr.path[temppathstrindex-1]=tempstr) and
+         (fat_get_file_class(Pfat_directory_structure(@unitcontent)^.directoryattribute,recindex>0)
+         and fat_directory_file=fat_directory_file) and (temppathstrindex=temppathstr.count) then
+          begin
+           inc(Result.count);
+           SetLength(Result.FileShortStr,Result.count);
+           Result.FileShortStr[Result.count-1]:=genfs_fat_extract_short_name(
+           Pfat_directory_structure(@unitcontent)^);
+           SetLength(Result.FileClass,Result.count);
+           Result.FileClass[Result.count-1]:=fat_directory_file;
+           SetLength(Result.FilePath,Result.count);
+           Result.FilePath[Result.count-1]:=basedir;
+           {Record the File Main Position(in cluster) and Sub Position(in number of
+           fat_directory_structure)}
+           SetLength(Result.FileMainPos,Result.count);
+           SetLength(Result.FileSubPos,Result.count);
+           if(startindex<>0) then
+            begin
+             Result.FileMainPos[Result.count-1]:=Startindex;
+             Result.FileSubPos[Result.count-1]:=startoffset-1;
+            end
+           else
+            begin
+             Result.FileMainPos[Result.count-1]:=SearchMainPos;
+             Result.FileSubPos[Result.count-1]:=SearchSubPos-1;
+            end;
+           {Record the File Directory's actual size}
+           SetLength(Result.FileStructSize,Result.count);
+           Result.FileStructSize[Result.count-1]:=recindex+1;
+          end;
+         if(fatstr.unicodefncount>0) then
           begin
            FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
           end;
-         bool:=false;
+         recindex:=0; startindex:=0; startoffset:=0;
+         FreeMem(tempstr);
         end;
-       inc(offset,sizeof(fat_directory_structure));
-       tempnum:=offset div (fs.fat32.header.head.bpb_bytesPerSector*
-       fs.fat32.header.head.bpb_SectorPerCluster)+2;
-       tempnum2:=(offset-sizeof(fat_directory_structure)) div (fs.fat32.header.head.bpb_bytesPerSector*
-       fs.fat32.header.head.bpb_SectorPerCluster)+2;
-       if(tempnum>tempnum2) then
+       {If the read offset is on the boundary of the cluster,go to next cluster or search ended.}
+       if(SearchSubPos=BytePerSector*SectorPerCluster shr 5) then
         begin
-         ii1:=tempnum2 shr 1; ii2:=tempnum mod 2;
-         if(fat32_check_cluster_status((fs.fat32.entrypair+ii1)^.entry32[ii2+1])<>fat_using) then break
-         else offset:=((fs.fat32.entrypair+ii1)^.entry32[ii2+1]-2)
-         *fs.fat32.header.head.bpb_bytesPerSector*fs.fat32.header.head.bpb_SectorPerCluster;
+         clustervalue:=genfs_fat_read_entry(fs,SearchMainPos);
+         if(fat32_check_cluster_status(clustervalue.entry32)=fat_end)
+         or(fat32_check_cluster_status(clustervalue.entry32)=fat_cluster_broken)then
+          begin
+           break;
+          end
+         else if(fat32_check_cluster_status(clustervalue.entry32)<>fat_end)
+         and(fat32_check_cluster_status(clustervalue.entry32)<>fat_cluster_broken)then
+          begin
+           SearchMainPos:=clustervalue.entry32;
+           SearchSubPos:=0;
+          end;
+        end;
+      end;
+     if(temppathstrindex<=temppath.Count) then exit(Result);
+     while(True)do
+      begin
+       genfs_io_read(fs,unitcontent,fs.fat32.datastart+(SearchMainPos-2)*
+       BytePerSector*SectorPerCluster+SearchSubPos*sizeof(fat_directory_structure),
+       sizeof(fat_directory_structure));
+       inc(SearchSubPos);
+       if(unitcontent[1]=$00) then
+        begin
+         {Indicate the Directory is ended.}
+         break;
+        end
+       else if(unitcontent[12]=fat_attribute_long_name) then
+        begin
+         {Add the long directory structure item to Directory.}
+         inc(fatstr.unicodefncount);
+         ReallocMem(fatstr.unicodefn,sizeof(fat_long_directory_structure)*fatstr.unicodefncount);
+         fat_MoveLongDirStructStringToFatString(Pfat_long_directory_structure(@unitcontent)^,
+         fatstr,fatstr.unicodefncount);
+         if(recindex=0) then
+          begin
+           startindex:=SearchMainPos; startoffset:=SearchSubPos;
+          end;
+         inc(recindex);
+        end
+       else if(unitcontent[12]<>fat_attribute_long_name) then
+        begin
+         inc(Result.count);
+         {Files in FAT32 are always have short name,record it.}
+         SetLength(Result.FileShortStr,Result.count);
+         Result.FileShortStr[Result.count-1]:=
+         genfs_fat_extract_short_name(Pfat_directory_structure(@unitcontent)^);
+         {Record the File Class of File.}
+         SetLength(Result.FileClass,Result.count);
+         Result.FileClass[Result.count-1]:=
+         fat_get_file_class(Pfat_directory_structure(@unitcontent)^.directoryattribute,recindex>0);
+         {Record the File Full Path}
+         SetLength(Result.FilePath,Result.count);
+         fat_MoveDirStructStringToFatString(Pfat_directory_structure(@unitcontent)^,fatstr);
+         tempstr:=fat_FatStringToPWideChar(fatstr);
+         if(basedir='\') or (basedir='/') then
+         Result.FilePath[Result.count-1]:=basedir+tempstr
+         else
+         Result.FilePath[Result.count-1]:=basedir+'/'+tempstr;
+         {Record the File Main Position(in cluster) and Sub Position(in number of
+         fat_directory_structure)}
+         SetLength(Result.FileMainPos,Result.count);
+         SetLength(Result.FileSubPos,Result.count);
+         if(startindex<>0) then
+          begin
+           Result.FileMainPos[Result.count-1]:=Startindex;
+           Result.FileSubPos[Result.count-1]:=startoffset-1;
+          end
+         else
+          begin
+           Result.FileMainPos[Result.count-1]:=SearchMainPos;
+           Result.FileSubPos[Result.count-1]:=SearchSubPos-1;
+          end;
+         {Record the File Directory's actual size}
+         SetLength(Result.FileStructSize,Result.count);
+         Result.FileStructSize[Result.count-1]:=recindex+1;
+         {If the file is directory,then search into its content}
+         if(UnicodeString(tempstr)='.') and (UnicodeString(tempstr)='..') then
+         inc(Result.FilePrevNextCount);
+         if(UnicodeString(tempstr)<>'.') and (UnicodeString(tempstr)<>'..') and
+         (Result.FileClass[Result.count-1] and fat_directory_directory=fat_directory_directory) then
+          begin
+           {Confirm the position of Directory Content(in cluster)}
+           tempdirpos:=Pfat_directory_structure(@unitcontent)^.directoryfirstclusterhighword shl 16+
+           Pfat_directory_structure(@unitcontent)^.directoryfirstclusterlowword;
+           temppath:=genfs_filesystem_search_for_path(fs,
+           Result.FilePath[Result.count-1],tempdirpos);
+           {Insert the temppath's content to main Result}
+           for i:=1 to temppath.Count do
+            begin
+             inc(Result.count);
+             SetLength(Result.FilePath,Result.count);
+             Result.FilePath[Result.count-1]:=temppath.FilePath[i-1];
+             SetLength(Result.FileShortStr,Result.count);
+             Result.FileShortStr[Result.count-1]:=temppath.FileShortStr[i-1];
+             SetLength(Result.FileMainPos,Result.count);
+             Result.FileMainPos[Result.count-1]:=temppath.FileMainPos[i-1];
+             SetLength(Result.FileSubPos,Result.count);
+             Result.FileSubPos[Result.count-1]:=temppath.FileSubPos[i-1];
+             SetLength(Result.FileClass,Result.count);
+             Result.FileClass[Result.count-1]:=temppath.FileClass[i-1];
+             SetLength(Result.FileStructSize,Result.count);
+             Result.FileStructSize[Result.count-1]:=temppath.FileClass[i-1];
+            end;
+           {Release the memory of variable temppath}
+           SetLength(temppath.FilePath,0);
+           SetLength(temppath.FileShortStr,0);
+           SetLength(temppath.FileMainPos,0);
+           SetLength(temppath.FileSubPos,0);
+           SetLength(temppath.FileClass,0);
+           SetLength(temppath.FileStructSize,0);
+          end;
+         if(fatstr.unicodefncount>0) then
+          begin
+           FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+          end;
+         FreeMem(tempstr);
+         recindex:=0; startindex:=0; startoffset:=0;
+        end;
+       {If the read offset is on the boundary of the cluster,go to next cluster or search ended.}
+       if(SearchSubPos=BytePerSector*SectorPerCluster shr 5) then
+        begin
+         clustervalue:=genfs_fat_read_entry(fs,SearchMainPos);
+         if(fat32_check_cluster_status(clustervalue.entry32)=fat_end)
+         or(fat32_check_cluster_status(clustervalue.entry32)=fat_cluster_broken)then
+          begin
+           break;
+          end
+         else if(fat32_check_cluster_status(clustervalue.entry32)<>fat_end)
+         and(fat32_check_cluster_status(clustervalue.entry32)<>fat_cluster_broken)then
+          begin
+           SearchMainPos:=clustervalue.entry32;
+           SearchSubPos:=0;
+          end;
         end;
       end;
     end;
@@ -1726,1620 +2026,2163 @@ begin
   begin
 
   end;
-end;
-{FAT File System next number of clusters}
-function genfs_filesystem_get_next_cluster(fs:genfs_filesystem;startcluster:SizeUint;count:SizeUint):genfs_index_list;
-var i,ii1,ii2,index:SizeUint;
-begin
- index:=0; Result.count:=count; SetLength(Result.index,count);
- if(fs.fsname=filesystem_fat12) then
+ if(ismask) then
   begin
-   i:=startcluster;
-   while(i<=fs.fat12.entrycount shl 1)do
+   {Rehandle the Result and delete all file path don't match the mask}
+   if(fs.fsname=filesystem_fat12) or (fs.fsname=filesystem_fat16) or (fs.fsname=filesystem_fat32) then
     begin
-     ii1:=i shr 1; ii2:=i mod 2;
-     if(index>=count) then break;
-     if(ii2=0) then
+     i:=1;
+     while(i<=Result.count) do
       begin
-       if(fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry1)=fat_available) then
+       if(genfs_mask_match(inputbasedir,Result.FilePath[i-1])) then
         begin
-         inc(index); Result.index[index-1]:=i;
-        end;
-      end
-     else if(ii2=1) then
-      begin
-       if(fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry2)=fat_available) then
-        begin
-         inc(index); Result.index[index-1]:=i;
-        end;
-      end;
-     inc(i);
-    end;
-  end
- else if(fs.fsname=filesystem_fat16) then
-  begin
-   i:=startcluster;
-   while(i<=fs.fat16.entrycount shl 1)do
-    begin
-     ii1:=i shr 1; ii2:=i mod 2;
-     if(index>=count) then break;
-     if(fat16_check_cluster_status((fs.fat16.entrypair+ii1)^.entry16[ii2+1])=fat_available) then
-      begin
-       inc(index); Result.index[index-1]:=i;
-      end;
-     inc(i);
-    end;
-  end
- else if(fs.fsname=filesystem_fat32) then
-  begin
-   i:=startcluster;
-   while(i<=fs.fat32.entrycount shl 1)do
-    begin
-     ii1:=i shr 1; ii2:=i mod 2;
-     if(index>=count) then break;
-     if(fat32_check_cluster_status((fs.fat32.entrypair+ii1)^.entry32[ii2+1])=fat_available) then
-      begin
-       inc(index); Result.index[index-1]:=i;
-      end;
-     inc(i);
-    end;
-  end;
-end;
-{Get What Cluster is using by this directory}
-function genfs_filesystem_get_using_cluster(fs:genfs_filesystem;startcluster:SizeUint):genfs_index_list;
-var i,ii1,ii2,index:SizeUint;
-begin
- Result.count:=0; SetLength(Result.index,1);
- if(fs.fsname=filesystem_fat12) then
-  begin
-   i:=startcluster;
-   while(i<=fs.fat12.entrycount shl 1)do
-    begin
-     ii1:=i shr 1; ii2:=i mod 2;
-     if(ii2=0) then
-      begin
-       if(fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry1)<>fat_end)
-       and (fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry1)<>fat_cluster_broken) then
-        begin
-         inc(Result.count);
-         SetLength(Result.index,Result.count);
-         Result.index[Result.count-1]:=i;
-         if(i<>(fs.fat12.entrypair+ii1)^.entry12.entry1) then
-         i:=(fs.fat12.entrypair+ii1)^.entry12.entry1
-         else break;
-        end
-       else if(fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry1)=fat_end) then
-        begin
-         inc(Result.count);
-         SetLength(Result.index,Result.count);
-         Result.index[Result.count-1]:=i; break;
-        end
-       else break;
-      end
-     else if(ii2=1) then
-      begin
-       if(fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry2)<>fat_end)
-       and (fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry2)<>fat_cluster_broken) then
-        begin
-         inc(Result.count);
-         SetLength(Result.index,Result.count);
-         Result.index[Result.count-1]:=i;
-         if(i<>(fs.fat12.entrypair+ii1)^.entry12.entry2) then
-         i:=(fs.fat12.entrypair+ii1)^.entry12.entry2
-         else break;
-        end
-       else if(fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry2)=fat_end) then
-        begin
-         inc(Result.count);
-         SetLength(Result.index,Result.count);
-         Result.index[Result.count-1]:=i; break;
-        end
-       else break;
-      end;
-    end;
-  end
- else if(fs.fsname=filesystem_fat16) then
-  begin
-   i:=startcluster;
-   while(i<=fs.fat16.entrycount shl 1)do
-    begin
-     ii1:=i shr 1; ii2:=i mod 2;
-     if(fat16_check_cluster_status((fs.fat16.entrypair+ii1)^.entry16[ii2+1])<>fat_end)
-     and (fat16_check_cluster_status((fs.fat16.entrypair+ii1)^.entry16[ii2+1])<>fat_cluster_broken) then
-      begin
-       inc(Result.count);
-       SetLength(Result.index,Result.count);
-       Result.index[Result.count-1]:=i;
-       if(i<>(fs.fat16.entrypair+ii1)^.entry16[ii2+1]) then
-       i:=(fs.fat16.entrypair+ii1)^.entry16[ii2+1]
-       else break;
-      end
-     else if(fat16_check_cluster_status((fs.fat16.entrypair+ii1)^.entry16[ii2+1])<>fat_end) then
-      begin
-       inc(Result.count);
-       SetLength(Result.index,Result.count);
-       Result.index[Result.count-1]:=i; break;
-      end
-     else break;
-    end;
-  end
- else if(fs.fsname=filesystem_fat32) then
-  begin
-   i:=startcluster;
-   while(i<=fs.fat32.entrycount shl 1)do
-    begin
-     ii1:=i shr 1; ii2:=i mod 2;
-     if(fat32_check_cluster_status((fs.fat32.entrypair+ii1)^.entry32[ii2+1])<>fat_end)
-     and(fat32_check_cluster_status((fs.fat32.entrypair+ii1)^.entry32[ii2+1])<>fat_cluster_broken) then
-      begin
-       inc(Result.count);
-       SetLength(Result.index,Result.count);
-       Result.index[Result.count-1]:=i;
-       if(i<>(fs.fat32.entrypair+ii1)^.entry32[ii2+1]) then
-       i:=(fs.fat32.entrypair+ii1)^.entry32[ii2+1]
-       else break;
-      end
-     else if(fat32_check_cluster_status((fs.fat32.entrypair+ii1)^.entry32[ii2+1])=fat_end) then
-      begin
-       inc(Result.count);
-       SetLength(Result.index,Result.count);
-       Result.index[Result.count-1]:=i; break;
-      end
-     else break;
-    end;
-  end;
-end;
-{Extract the File Name from File Path}
-function genfs_extract_filename(const str:UnicodeString):UnicodeString;
-var i:SizeUint;
-begin
- i:=length(str);
- while(i>0)do
-  begin
-   if(str[i]='/') or (str[i]='\') then break;
-   dec(i);
-  end;
- Result:=Copy(str,i+1,length(str)-i);
-end;
-{Extract the File Path from File Path}
-function genfs_extract_filepath(const str:UnicodeString):UnicodeString;
-var i:SizeUint;
-begin
- i:=length(str);
- while(i>0)do
-  begin
-   if(str[i]='/') or (str[i]='\') then break;
-   dec(i);
-  end;
- Result:=Copy(str,1,i-1);
-end;
-{FAT File System edit item name}
-procedure genfs_filesystem_reset_name(var fs:genfs_filesystem;basedir:UnicodeString);
-var i,j,k,len:SizeUint;
-    inlist:genfs_inner_path;
-    filename:UnicodeString;
-    tempstr,tempstr2:PWideChar;
-begin
- if(fs.fsname<>filesystem_fat12) and (fs.fsname<>filesystem_fat16)
- and (fs.fsname<>filesystem_fat32) then exit;
- i:=1;
- inlist:=genfs_search_for_path(fs,basedir);
- while(i<=inlist.Count)do
-  begin
-   j:=1;
-   while(j<=inlist.count)do
-    begin
-     if(i=j) then
-      begin
-       inc(j); continue;
-      end;
-     if(inlist.FilePath[i-1]='') or (inlist.FilePath[j-1]='') then
-      begin
-       inc(j); continue;
-      end;
-     if(genfs_check_same_path(inlist.FilePath[i-1],inlist.FilePath[j-1])=false) then
-      begin
-       inc(j); continue;
-      end;
-     if(inlist.FileShortStr[i-1]=inlist.FileShortStr[j-1]) then
-      begin
-       len:=length(inlist.FileShortStr[i-1]);
-       if(len>=8) and (inlist.FileShortStr[i-1][8]>='9') then
-        begin
-         filename:=inlist.FilePath[i-1];
-         tempstr:=UnicodeStringToPWideChar(filename);
-         tempstr2:=fat_get_latter_four_random_char(tempstr);
-         inlist.FileShortStr[i-1]:=
-         Copy(inlist.FileShortStr[i-1],1,2)+UnicodeStringToString(tempstr2)
-         +'~1.'+Copy(inlist.FileShortStr[i-1],10,3);
-         for k:=1 to 8 do
-          begin
-           if(k>len) then break
-           else
-            begin
-             if(fs.fsname=filesystem_fat12) then
-             genfs_io_write(fs,Char(inlist.FileShortStr[i-1][k]),
-             fs.fat12.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-             sizeof(fat_directory_structure)+k-1,1)
-             else if(fs.fsname=filesystem_fat12) then
-             genfs_io_write(fs,Char(inlist.FileShortStr[i-1][k]),
-             fs.fat16.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-             sizeof(fat_directory_structure)+k-1,1)
-             else if(fs.fsname=filesystem_fat12) then
-             genfs_io_write(fs,Char(inlist.FileShortStr[i-1][k]),
-             fs.fat32.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-             sizeof(fat_directory_structure)+k-1,1);
-            end;
-          end;
-         for k:=10 to 12 do
-          begin
-           if(k>len) then break
-           else
-            begin
-             if(fs.fsname=filesystem_fat12) then
-             genfs_io_write(fs,Char(inlist.FileShortStr[i-1][k]),
-             fs.fat12.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-             sizeof(fat_directory_structure)+k-2,1)
-             else if(fs.fsname=filesystem_fat12) then
-             genfs_io_write(fs,Char(inlist.FileShortStr[i-1][k]),
-             fs.fat16.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-             sizeof(fat_directory_structure)+k-2,1)
-             else if(fs.fsname=filesystem_fat12) then
-             genfs_io_write(fs,Char(inlist.FileShortStr[i-1][k]),
-             fs.fat32.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-             sizeof(fat_directory_structure)+k-2,1);
-            end;
-          end;
-        end
-       else if(len>=8) then
-        begin
-         inlist.FileShortStr[i-1][8]:=WideChar(Word(inlist.FileShortStr[i-1][8])+1);
-         for k:=1 to 8 do
-          begin
-           if(k>len) then break
-           else
-            begin
-             if(fs.fsname=filesystem_fat12) then
-             genfs_io_write(fs,Char(inlist.FileShortStr[i-1][k]),
-             fs.fat12.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-             sizeof(fat_directory_structure)+k-1,1)
-             else if(fs.fsname=filesystem_fat12) then
-             genfs_io_write(fs,Char(inlist.FileShortStr[i-1][k]),
-             fs.fat16.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-             sizeof(fat_directory_structure)+k-1,1)
-             else if(fs.fsname=filesystem_fat12) then
-             genfs_io_write(fs,Char(inlist.FileShortStr[i-1][k]),
-             fs.fat32.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-             sizeof(fat_directory_structure)+k-1,1);
-            end;
-          end;
-         for k:=10 to 12 do
-          begin
-           if(k>len) then break
-           else
-            begin
-             if(fs.fsname=filesystem_fat12) then
-             genfs_io_write(fs,Char(inlist.FileShortStr[i-1][k]),
-             fs.fat12.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-             sizeof(fat_directory_structure)+k-2,1)
-             else if(fs.fsname=filesystem_fat12) then
-             genfs_io_write(fs,Char(inlist.FileShortStr[i-1][k]),
-             fs.fat16.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-             sizeof(fat_directory_structure)+k-2,1)
-             else if(fs.fsname=filesystem_fat12) then
-             genfs_io_write(fs,Char(inlist.FileShortStr[i-1][k]),
-             fs.fat32.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-             sizeof(fat_directory_structure)+k-2,1);
-            end;
-          end;
-        end;
-      end;
-     inc(j);
-    end;
-   inc(i);
-  end;
-end;
-{File System Path Combiner}
-function genfs_filesystem_combine_path(path1,path2:UnicodeString):UnicodeString;
-var len1,len2:SizeUint;
-begin
- len1:=length(path1); len2:=length(path2);
- if(len1>=1) and ((path1[len1]='/') or (path1[len1]='\')) then Result:=path1+path2
- else if(len2>=1) and ((path2[1]='/') or (path2[1]='\')) then Result:=path1+path2
- else Result:=path1+'/'+path2;
-end;
-{File System Add item}
-procedure genfs_filesystem_add(var fs:genfs_filesystem;srcpath:UnicodeString;indestpath:UnicodeString);
-var extlist:genfs_path;
-    inlist:genfs_inner_path;
-    path:genfs_path_string;
-    tempstr:PWideChar;
-    fatstr:fat_string;
-    fatdir:fat_directory;
-    rootpath,tempdestpath,detectpath,temppath,temppath2:UnicodeString;
-    offset:SizeUint;
-    rootlen:SizeUint;
-    bool:boolean;
-    i,j,k,m,n,a,b,c,len:SizeUint;
-    destpath:UnicodeString;
-    {For FAT Only}
-    tempPrevPos:SizeUint;
-    tempStartPos:SizeUint;
-    tempNextCluster:SizeUint;
-    tempNextPos,tempNextPos2:SizeUint;
-    tempNextOffset,tempNextOffset2:SizeUint;
-    tempOffset:SizeUint;
-    tempindex:SizeUint;
-    tempHaveDot:boolean;
-    templist:genfs_index_list;
-    EraseDir:boolean;
-    EraseCount:SizeUint;
-    CompareCount:SizeUint;
-    sdir:fat_directory_structure;
-    tempbool:boolean;
-    tempnewoffset:SizeUint;
-    {For File System Specific Only}
-    tempnum1,tempnum2,tempnum3,tempnum4,tempnum5,ii1,ii2:SizeUint;
-    copycontent:array[1..512] of byte;
-begin
- len:=length(indestpath);
- if(len>1) and ((indestpath[len]='\') or (indestpath[len]='/')) then
-  begin
-   destpath:=Copy(indestpath,1,len-1);
-  end
- else destpath:=indestpath;
- bool:=genfs_is_mask(srcpath);
- if(bool) then
-  begin
-   len:=length(srcpath); i:=len;
-   while(i>0)do
-    begin
-     if(srcpath[i]='/') or (srcpath[i]='\') then break;
-     dec(i);
-    end;
-   rootpath:=Copy(srcpath,1,i); rootlen:=i;
-  end
- else
-  begin
-   len:=length(srcpath);
-   if(FileExists(srcpath)) and ((destpath='\') or (destpath='/')) then
-    begin
-     rootpath:=genfs_extract_filepath(srcpath)+'/'; rootlen:=length(rootpath);
-    end
-   else if(FileExists(srcpath)) then
-    begin
-     rootpath:=srcpath; rootlen:=length(srcpath);
-    end
-   else if(srcpath[len]='/') or (srcpath[len]='\') then
-    begin
-     rootpath:=Copy(srcpath,1,len-1); rootlen:=length(srcpath)-1;
-    end
-   else
-    begin
-     rootpath:=genfs_extract_filepath(srcpath)+'/'; rootlen:=length(rootpath);
-    end;
-  end;
- extlist:=genfs_search_for_path_external(srcpath,bool);
- inlist:=genfs_search_for_path(fs,'/'); i:=1;
- if(fs.fsname=filesystem_fat12) or (fs.fsname=filesystem_fat16) or
- (fs.fsname=filesystem_fat32) then
-  begin
-   if(fs.fsname=filesystem_fat12) then
-    begin
-     tempnum1:=fs.fat12.header.head.bpb_bytesPerSector;
-     tempnum2:=fs.fat12.header.head.bpb_SectorPerCluster;
-    end
-   else if(fs.fsname=filesystem_fat16) then
-    begin
-     tempnum1:=fs.fat16.header.head.bpb_bytesPerSector;
-     tempnum2:=fs.fat16.header.head.bpb_SectorPerCluster;
-    end
-   else if(fs.fsname=filesystem_fat32) then
-    begin
-     tempnum1:=fs.fat32.header.head.bpb_bytesPerSector;
-     tempnum2:=fs.fat32.header.head.bpb_SectorPerCluster;
-    end;
-   if(fs.fsname=filesystem_fat12) then
-   tempprevpos:=2
-   else if(fs.fsname=filesystem_fat16) then
-   tempprevpos:=2
-   else if(fs.fsname=filesystem_fat32) then
-   tempprevpos:=fs.fat32.header.exthead.bpb_rootcluster;
-   tempnextpos:=tempprevpos;
-   tempnextoffset:=0;
-   for i:=1 to extlist.count do
-    begin
-     temppath:=Copy(extlist.FilePath[i-1],rootlen+1,length(extlist.Filepath[i-1])-rootlen);
-     detectpath:=genfs_filesystem_combine_path(destpath,temppath);
-     path:=genfs_path_to_path_string(detectpath);
-     temppath2:='/'; j:=1;
-     while(j<=path.count) do
-      begin
-       if(temppath2='/') or (temppath2='\') then
-       temppath2:=temppath2+path.path[j-1]
-       else
-       temppath2:=temppath2+'/'+path.path[j-1];
-       k:=1;
-       while(k<=inlist.Count)do
-        begin
-         if((temppath2=inlist.FilePath[k-1]) and (inlist.FileClass[k-1]<>fat_directory_volume)) then break;
-         inc(k);
-        end;
-       if(k<=inlist.count) then
-        begin
-         if(fs.fsname=filesystem_fat12) then
-         genfs_io_read(fs,sdir,fs.fat12.datastart+inlist.FileOffset[k-1],sizeof(fat_directory_structure))
-         else if(fs.fsname=filesystem_fat16) then
-         genfs_io_read(fs,sdir,fs.fat16.datastart+inlist.FileOffset[k-1],sizeof(fat_directory_structure))
-         else if(fs.fsname=filesystem_fat32) then
-         genfs_io_read(fs,sdir,fs.fat32.datastart+
-         inlist.FileOffset[k-1]+inlist.FileDirSize[k-1]-sizeof(fat_directory_structure),
-         sizeof(fat_directory_structure));
-         tempprevpos:=tempnextpos;
-         tempnextpos:=sdir.directoryfirstclusterhighword shl 16+
-         sdir.directoryfirstclusterlowword;
-         inc(j); continue;
-        end;
-       EraseDir:=false;
-       tempstr:=UnicodeStringToPWideChar(path.path[j-1]);
-       CompareCount:=fat_calculate_directory_size(tempstr) shr 5;
-       FreeMem(tempstr);
-       k:=1; b:=1; if(j>1) then temphavedot:=false else temphavedot:=true;
-       while(k<=inlist.count) do
-        begin
-         if(genfs_check_prefix(temppath2,inlist.FilePath[k-1],true))then
-          begin
-           if(inlist.FileFree[k-1]) and (EraseDir=false) then
-            begin
-             EraseDir:=true; EraseCount:=1;
-             tempNextPos2:=tempnextpos; tempNextOffset2:=tempnextoffset;
-            end
-           else if(inlist.FileFree[k-1]) and (EraseDir) then
-            begin
-             inc(EraseCount);
-            end
-           else if(inlist.FileFree[k-1]=false) then
-            begin
-             EraseDir:=false; EraseCount:=0;
-             if(CompareCount<=EraseCount) then
-              begin
-               tempnextpos:=tempnextpos2; tempnextoffset:=tempnextoffset2;
-               tempnextpos2:=0; tempnextoffset2:=0;
-               break;
-              end;
-            end;
-           if(inlist.FileFree[k-1]=false) then temphavedot:=true;
-           if((tempnextoffset+inlist.FileDirSize[k-1]) div (tempnum1*tempnum2)>=b) then
-            begin
-             tempbool:=false;
-             tempnewoffset:=(tempnextoffset+inlist.FileDirSize[k-1]);
-             while((tempnextoffset+inlist.FileDirSize[k-1]) div (tempnum1*tempnum2)>=b) do
-              begin
-               inc(b);
-               tempnewoffset:=tempnewoffset-tempnum1*tempnum2;
-               ii1:=tempnextpos shr 1; ii2:=tempnextpos mod 2;
-               if(fs.fsname=filesystem_fat12) then
-                begin
-                 if(ii2=0) and
-                 (fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry1)<>fat_using) and
-                 (fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry1)<>fat_cluster_broken)
-                 then
-                  begin
-                   tempnextpos:=(fs.fat12.entrypair+ii1)^.entry12.entry1;
-                  end
-                 else if(ii2=1) and
-                 (fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry2)<>fat_using) and
-                 (fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry2)<>fat_cluster_broken)
-                 then
-                  begin
-                   tempnextpos:=(fs.fat12.entrypair+ii1)^.entry12.entry2;
-                  end;
-                end
-               else if(fs.fsname=filesystem_fat16) then
-                begin
-                 tempnextpos:=(fs.fat16.entrypair+ii1)^.entry16[ii2+1];
-                end
-               else if(fs.fsname=filesystem_fat32) then
-                begin
-                 tempnextpos:=(fs.fat32.entrypair+ii1)^.entry32[ii2+1];
-                end;
-              end;
-             if(tempnextoffset=0) then tempbool:=true else tempbool:=false;
-             m:=3;
-             if(fs.fsname=filesystem_fat12) then
-              begin
-               while(m<=fs.fat12.entrycount shl 1) and (tempbool=true) do
-                begin
-                 if(m=tempprevpos+1) then
-                  begin
-                   inc(m); continue;
-                  end;
-                 ii1:=m shr 1; ii2:=m mod 2;
-                 if(ii2=1) and
-                 (fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry1)<>fat_using) and
-                 (fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry1)<>fat_cluster_broken)
-                 then
-                  begin
-                   tempnextpos:=m-1; break;
-                  end
-                 else if(ii2=0) and
-                 (fat12_check_cluster_status((fs.fat12.entrypair+ii1-1)^.entry12.entry2)<>fat_using) and
-                 (fat12_check_cluster_status((fs.fat12.entrypair+ii1-1)^.entry12.entry2)<>fat_cluster_broken)
-                 then
-                  begin
-                   tempnextpos:=m-1; break;
-                  end;
-                 inc(m);
-                end;
-              end
-             else if(fs.fsname=filesystem_fat16) then
-              begin
-               while(m<=fs.fat16.entrycount shl 1) and (tempbool=true) do
-                begin
-                 if(m=tempprevpos+1) then
-                  begin
-                   inc(m); continue;
-                  end;
-                 ii1:=(m-1) shr 1; ii2:=(m-1) mod 2;
-                 if(fat16_check_cluster_status((fs.fat16.entrypair+ii1)^.entry16[ii2+1])<>fat_using)
-                 and(fat16_check_cluster_status((fs.fat16.entrypair+ii1)^.entry16[ii2+1])<>fat_cluster_broken)then
-                  begin
-                   tempnextpos:=m-1; break;
-                  end;
-                 inc(m);
-                end;
-              end
-             else if(fs.fsname=filesystem_fat32) then
-              begin
-               while(m<=fs.fat32.entrycount shl 1) and (tempbool=true) do
-                begin
-                 if(m=tempprevpos+1) then
-                  begin
-                   inc(m); continue;
-                  end;
-                 ii1:=(m-1) shr 1; ii2:=(m-1) mod 2;
-                 if(fat32_check_cluster_status((fs.fat32.entrypair+ii1)^.entry32[ii2+1])<>fat_using)
-                 and(fat32_check_cluster_status((fs.fat32.entrypair+ii1)^.entry32[ii2+1])<>fat_cluster_broken)then
-                  begin
-                   tempnextpos:=m-1; break;
-                  end;
-                 inc(m);
-                end;
-              end;
-            end
-           else inc(tempnextoffset,inlist.FileDirSize[k-1]);
-          end;
-         inc(k);
-        end;
-       n:=3;
-       if(fs.fsname=filesystem_fat12) then
-        begin
-         while(n<=fs.fat12.entrycount shl 1) do
-          begin
-           if(n=tempnextpos+1) or (n=tempprevpos+1) then
-            begin
-             inc(n); continue;
-            end;
-           ii1:=n shr 1; ii2:=n mod 2;
-           if(ii2=1) and
-           (fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry1)=fat_available) then
-             begin
-              tempnextcluster:=n-1; break;
-             end
-            else if(ii2=0) and
-            (fat12_check_cluster_status((fs.fat12.entrypair+ii1-1)^.entry12.entry2)=fat_available) then
-             begin
-              tempnextcluster:=n-1; break;
-             end;
-           inc(n);
-          end;
-        end
-       else if(fs.fsname=filesystem_fat16) then
-        begin
-         while(n<=fs.fat16.entrycount shl 1) do
-          begin
-           if(n=tempnextpos+1) or (n=tempprevpos+1) then
-            begin
-             inc(n); continue;
-            end;
-           ii1:=(n-1) shr 1; ii2:=(n-1) mod 2;
-           if(fat16_check_cluster_status((fs.fat16.entrypair+ii1)^.entry16[ii2+1])=fat_available)then
-            begin
-             tempnextcluster:=n-1; break;
-            end;
-           inc(n);
-          end;
-        end
-       else if(fs.fsname=filesystem_fat32) then
-        begin
-         while(n<=fs.fat32.entrycount shl 1) do
-          begin
-           if(n=tempnextpos+1) or (n=tempprevpos+1) then
-            begin
-             inc(n); continue;
-            end;
-           ii1:=(n-1) shr 1; ii2:=(n-1) mod 2;
-           if(fat32_check_cluster_status((fs.fat32.entrypair+ii1)^.entry32[ii2+1])=fat_available)then
-            begin
-             tempnextcluster:=n-1; break;
-            end;
-           inc(n);
-          end;
-        end;
-       if(fs.fsname=filesystem_fat12) then
-        begin
-         if(temphavedot=false) and (j>1) then
-          begin
-           tempstr:=UnicodeStringToPWideChar('.');
-           fatstr:=fat_PWideCharToFatString(tempstr);
-           FreeMem(tempstr);
-           fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory,
-           genfs_date_to_fat_date,genfs_time_to_fat_time,0,
-           tempnextpos);
-           genfs_io_write(fs,fatdir.dir,
-           fs.fat12.datastart+(tempnextpos-2)*tempnum1*tempnum2+tempnextoffset,sizeof(fat_directory_structure));
-           inc(tempnextoffset,sizeof(fat_directory_structure));
-           tempstr:=UnicodeStringToPWideChar('..');
-           fatstr:=fat_PWideCharToFatString(tempstr);
-           FreeMem(tempstr);
-           fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory,
-           genfs_date_to_fat_date,genfs_time_to_fat_time,0,
-           tempprevpos);
-           genfs_io_write(fs,fatdir.dir,
-           fs.fat12.datastart+(tempnextpos-2)*tempnum1*tempnum2+tempnextoffset,sizeof(fat_directory_structure));
-           inc(tempnextoffset,sizeof(fat_directory_structure));
-          end;
-         ii1:=tempnextpos shr 1; ii2:=tempnextpos mod 2;
-         if(ii2=0) and
-         (fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry1)=fat_available) then
-          begin
-           (fs.fat12.entrypair+ii1)^.entry12.entry1:=fat12_final_cluster_low;
-          end
-         else if(ii2=1) and
-         (fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry2)=fat_available) then
-           begin
-            (fs.fat12.entrypair+ii1)^.entry12.entry2:=fat12_final_cluster_low;
-           end;
-         if(tempnextoffset=0) then
-          begin
-           ii1:=tempprevpos shr 1; ii2:=tempprevpos mod 2;
-           if(ii2=0) and
-           (fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry1)<>fat_using)
-           and(fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry1)<>fat_cluster_broken)
-            then
-             begin
-              (fs.fat12.entrypair+ii1)^.entry12.entry1:=tempnextpos;
-             end
-           else if(ii2=1) and
-           (fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry2)<>fat_using)
-           and(fat12_check_cluster_status((fs.fat12.entrypair+ii1)^.entry12.entry2)<>fat_cluster_broken)
-            then
-             begin
-              (fs.fat12.entrypair+ii1)^.entry12.entry2:=tempnextpos;
-             end;
-          end;
-         tempstr:=UnicodeStringToPWideChar(path.path[j-1]);
-         fatstr:=fat_PWideCharToFatString(tempstr);
-         FreeMem(tempstr);
-         if(j=path.count) and (extlist.IsFile[i-1]) then
-         fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_file,
-         genfs_date_to_fat_date,genfs_time_to_fat_time,
-         genfs_external_file_size(extlist.FilePath[i-1]),
-         tempnextcluster)
-         else
-         fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory,
-         genfs_date_to_fat_date,genfs_time_to_fat_time,0,
-         tempnextcluster);
-         genfs_io_write(fs,fatdir.dir,
-         fs.fat12.datastart+tempnextpos*tempnum1*tempnum2+tempnextoffset,sizeof(fat_directory_structure));
-         inc(tempnextoffset,sizeof(fat_directory_structure));
-        end
-       else if(fs.fsname=filesystem_fat16) then
-        begin
-         if(temphavedot=false) and (j>1) then
-          begin
-           ii1:=tempnextpos shr 1; ii2:=tempnextpos mod 2;
-           (fs.fat32.entrypair+ii1)^.entry32[ii2+1]:=fat32_final_cluster_low;
-           tempstr:=UnicodeStringToPWideChar('.');
-           fatstr:=fat_PWideCharToFatString(tempstr);
-           FreeMem(tempstr);
-           fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory,
-           genfs_date_to_fat_date,genfs_time_to_fat_time,0,
-           tempnextpos);
-           genfs_io_write(fs,fatdir.dir,
-           fs.fat16.datastart+(tempnextpos-2)*tempnum1*tempnum2+tempnextoffset,sizeof(fat_directory_structure));
-           inc(tempnextoffset,sizeof(fat_directory_structure));
-           tempstr:=UnicodeStringToPWideChar('..');
-           fatstr:=fat_PWideCharToFatString(tempstr);
-           FreeMem(tempstr);
-           fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory,
-           genfs_date_to_fat_date,genfs_time_to_fat_time,0,
-           tempprevpos);
-           genfs_io_write(fs,fatdir.dir,
-           fs.fat16.datastart+(tempnextpos-2)*tempnum1*tempnum2+tempnextoffset,sizeof(fat_directory_structure));
-           inc(tempnextoffset,sizeof(fat_directory_structure));
-          end;
-         ii1:=tempnextpos shr 1; ii2:=tempnextpos mod 2;
-         if(fat16_check_cluster_status((fs.fat16.entrypair+ii1)^.entry16[ii2+1])=fat_available)then
-          begin
-           (fs.fat16.entrypair+ii1)^.entry16[ii2+1]:=fat16_final_cluster_low;
-          end;
-         if(tempnextoffset=0) then
-          begin
-           ii1:=tempprevpos shr 1; ii2:=tempprevpos mod 2;
-           if(fat16_check_cluster_status((fs.fat16.entrypair+ii1)^.entry16[ii2+1])<>fat_using)
-           and(fat16_check_cluster_status((fs.fat16.entrypair+ii1)^.entry16[ii2+1])<>fat_cluster_broken) then
-            begin
-             (fs.fat16.entrypair+ii1)^.entry16[ii2+1]:=tempnextpos;
-            end;
-          end;
-         tempstr:=UnicodeStringToPWideChar(path.path[j-1]);
-         fatstr:=fat_PWideCharToFatString(tempstr);
-         FreeMem(tempstr);
-         if(j=path.count) and (extlist.IsFile[i-1]) then
-         fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_file,
-         genfs_date_to_fat_date,genfs_time_to_fat_time,
-         genfs_external_file_size(extlist.FilePath[i-1]),
-         tempnextcluster)
-         else
-         fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory,
-         genfs_date_to_fat_date,genfs_time_to_fat_time,0,
-         tempnextcluster);
-         genfs_io_write(fs,fatdir.dir,
-         fs.fat16.datastart+tempnextpos*tempnum1*tempnum2+tempnextoffset,sizeof(fat_directory_structure));
-         inc(tempnextoffset,sizeof(fat_directory_structure));
-        end
-       else if(fs.fsname=filesystem_fat32) then
-        begin
-         if(temphavedot=false) and (j>1) then
-          begin
-           tempstr:=UnicodeStringToPWideChar('.');
-           fatstr:=fat_PWideCharToFatString(tempstr);
-           FreeMem(tempstr);
-           fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory,
-           genfs_date_to_fat_date,genfs_time_to_fat_time,0,tempnextpos);
-           genfs_io_write(fs,fatdir.dir,
-           fs.fat32.datastart+(tempnextpos-2)*tempnum1*tempnum2+tempnextoffset,sizeof(fat_directory_structure));
-           inc(tempnextoffset,sizeof(fat_directory_structure));
-           tempstr:=UnicodeStringToPWideChar('..');
-           fatstr:=fat_PWideCharToFatString(tempstr);
-           FreeMem(tempstr);
-           fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory,
-           genfs_date_to_fat_date,genfs_time_to_fat_time,0,
-           tempprevpos);
-           genfs_io_write(fs,fatdir.dir,
-           fs.fat32.datastart+(tempnextpos-2)*tempnum1*tempnum2+tempnextoffset,sizeof(fat_directory_structure));
-           inc(tempnextoffset,sizeof(fat_directory_structure));
-          end;
-         tempstr:=UnicodeStringToPWideChar(path.path[j-1]);
-         fatstr:=fat_PWideCharToFatString(tempstr);
-         FreeMem(tempstr);
-         if(j=path.count) and (extlist.IsFile[i-1]) then
-         fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_file,
-         genfs_date_to_fat_date,genfs_time_to_fat_time,
-         genfs_external_file_size(extlist.FilePath[i-1]),
-         tempnextcluster)
-         else
-         fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory,
-         genfs_date_to_fat_date,genfs_time_to_fat_time,0,
-         tempnextcluster);
-         if(tempnextoffset+(fatstr.unicodefncount+1)*
-         sizeof(fat_long_directory_structure)>tempnum1*tempnum2) then
-          begin
-           tempnum4:=(tempnextoffset+(fatstr.unicodefncount+1)*
-           sizeof(fat_long_directory_structure)
-           -tempnum1*tempnum2) div (tempnum1*tempnum2);
-           templist:=genfs_filesystem_get_next_cluster(fs,2,tempnum4+1);
-           ii1:=tempnextpos shr 1; ii2:=tempnextpos mod 2;
-           (fs.fat32.entrypair+ii1)^.entry32[ii2+1]:=templist.index[0];
-           for a:=1 to templist.count-1 do
-            begin
-             ii1:=templist.index[a-1] shr 1; ii2:=templist.index[a-1] mod 2;
-             if(a=templist.count-1) then
-              begin
-               (fs.fat32.entrypair+ii1)^.entry32[ii2+1]:=fat32_final_cluster_low;
-              end
-             else
-              begin
-               (fs.fat32.entrypair+ii1)^.entry32[ii2+1]:=templist.index[a];
-              end;
-            end;
-           tempnextcluster:=templist.index[templist.count-1];
-          end
-         else
-          begin
-           ii1:=tempnextpos shr 1; ii2:=tempnextpos mod 2;
-           (fs.fat32.entrypair+ii1)^.entry32[ii2+1]:=fat32_final_cluster_low;
-          end;
-         c:=2;
-         tempindex:=tempnextpos;
-         tempoffset:=tempnextoffset;
-         for a:=1 to (fatdir.longdircount+1) do
-          begin
-           if(tempoffset<tempnum1*tempnum2) then
-            begin
-             if(a<>fatdir.longdircount+1) then
-              begin
-               genfs_io_write(fs,(fatdir.longdir+a-1)^,
-               fs.fat32.datastart+(tempindex-2)*tempnum1*tempnum2+tempoffset,sizeof(fat_directory_structure));
-               inc(tempoffset,sizeof(fat_long_directory_structure));
-              end
-             else
-              begin
-               genfs_io_write(fs,fatdir.dir,
-               fs.fat32.datastart+(tempindex-2)*tempnum1*tempnum2+tempoffset,sizeof(fat_directory_structure));
-               inc(tempoffset,sizeof(fat_directory_structure));
-              end;
-            end
-           else if(tempoffset>=tempnum1*tempnum2) then
-            begin
-             tempindex:=templist.index[c-1];
-             tempoffset:=0;
-             if(a<>fatdir.longdircount+1) then
-              begin
-               genfs_io_write(fs,(fatdir.longdir+a-1)^,
-               fs.fat32.datastart+(tempindex-2)*tempnum1*tempnum2+tempoffset,sizeof(fat_directory_structure));
-               inc(tempoffset,sizeof(fat_long_directory_structure));
-              end
-             else
-              begin
-               genfs_io_write(fs,fatdir.dir,
-               fs.fat32.datastart+(tempindex-2)*tempnum1*tempnum2+tempoffset,sizeof(fat_directory_structure));
-               inc(tempoffset,sizeof(fat_directory_structure));
-              end;
-             inc(c);
-            end;
-          end;
-         tempnextoffset:=tempoffset;
-         tempnextpos:=tempnextcluster;
-         if(fatstr.unicodefn<>nil) then FreeMem(fatstr.unicodefn);
-         fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
-        end;
-       inc(j);
-       tempprevpos:=tempnextpos;
-       tempnextpos:=tempnextcluster;
-       tempnextoffset:=0;
-      end;
-     {Move the content of File In It}
-     if(extlist.IsFile[i-1]=true) then
-      begin
-       tempnum5:=genfs_external_file_size(extlist.FilePath[i-1]);
-       tempnum4:=genfs_external_file_size(extlist.FilePath[i-1]) div (tempnum1*tempnum2);
-       templist:=genfs_filesystem_get_next_cluster(fs,2,tempnum4+1);
-       tempindex:=templist.index[0]; tempoffset:=0; a:=1;
-       for c:=1 to templist.count-1 do
-        begin
-         ii1:=templist.index[c-1] shr 1; ii2:=templist.index[c-1] mod 2;
-         if(fs.fsname=filesystem_fat12) and (c=templist.count-1) then
-          begin
-           if(ii2=0) then
-            begin
-             (fs.fat12.entrypair+ii1)^.entry12.entry1:=fat12_final_cluster_low;
-            end
-           else if(ii2=1) then
-            begin
-             (fs.fat12.entrypair+ii1)^.entry12.entry2:=fat12_final_cluster_low;
-            end;
-          end
-         else if(fs.fsname=filesystem_fat12) then
-          begin
-           if(ii2=0) then
-            begin
-             (fs.fat12.entrypair+ii1)^.entry12.entry1:=templist.index[c];
-            end
-           else if(ii2=1) then
-            begin
-             (fs.fat12.entrypair+ii1)^.entry12.entry2:=templist.index[c];
-            end;
-          end
-         else if(fs.fsname=filesystem_fat16) and (c=templist.count-1) then
-          begin
-           (fs.fat16.entrypair+ii1)^.entry16[ii2+1]:=fat16_final_cluster_low;
-          end
-         else if(fs.fsname=filesystem_fat16) then
-          begin
-           (fs.fat16.entrypair+ii1)^.entry16[ii2+1]:=templist.index[c];
-          end
-         else if(fs.fsname=filesystem_fat32) and (c=templist.count-1) then
-          begin
-           (fs.fat32.entrypair+ii1)^.entry32[ii2+1]:=fat32_final_cluster_low;
-          end
-         else if(fs.fsname=filesystem_fat32) then
-          begin
-           (fs.fat32.entrypair+ii1)^.entry32[ii2+1]:=templist.index[c];
-          end;
-        end;
-       for c:=1 to (tempnum4*tempnum1*tempnum2+511) div 512 do
-        begin
-         if(c shl 9<=tempnum5) then
-          begin
-           genfs_external_io_read(extlist.FilePath[i-1],copycontent,(c-1)*512,512);
-           if(fs.fsname=filesystem_fat12) then
-           genfs_io_write(fs,copycontent,fs.fat12.datastart+
-           (tempindex-2)*tempnum1*tempnum2+tempoffset,512)
-           else if(fs.fsname=filesystem_fat16) then
-           genfs_io_write(fs,copycontent,fs.fat16.datastart+
-           (tempindex-2)*tempnum1*tempnum2+tempoffset,512)
-           else if(fs.fsname=filesystem_fat32) then
-           genfs_io_write(fs,copycontent,fs.fat32.datastart+
-           (tempindex-2)*tempnum1*tempnum2+tempoffset,512);
-          end
-         else
-          begin
-           genfs_external_io_read(extlist.FilePath[i-1],copycontent,(c-1)*512,
-           c shl 9-tempnum5);
-           if(fs.fsname=filesystem_fat12) then
-           genfs_io_write(fs,copycontent,fs.fat12.datastart+
-           (tempindex-2)*tempnum1*tempnum2+tempoffset,
-           c shl 9-tempnum5)
-           else if(fs.fsname=filesystem_fat16) then
-           genfs_io_write(fs,copycontent,fs.fat16.datastart+
-           (tempindex-2)*tempnum1*tempnum2+tempoffset,
-           c shl 9-tempnum5)
-           else if(fs.fsname=filesystem_fat32) then
-           genfs_io_write(fs,copycontent,fs.fat32.datastart+
-           (tempindex-2)*tempnum1*tempnum2+tempoffset,
-           c shl 9-tempnum5);
-          end;
-         inc(tempoffset,512);
-         if(tempoffset>=tempnum1*tempnum2) then
-          begin
-           inc(a);
-           tempindex:=templist.index[a-1]; tempoffset:=0;
-          end;
-        end;
-       tempnextcluster:=templist.index[templist.count-1];
-      end;
-    end;
-   bool:=false;
-   if(fs.fsname=filesystem_fat32) then
-    begin
-     i:=2; fs.fat32.fsinfo.freecount:=0;
-     while(i<=fs.fat32.entrycount shl 1) do
-      begin
-       ii1:=i shr 1; ii2:=i mod 2;
-       if(fat32_check_cluster_status((fs.fat32.entrypair+ii1)^.entry32[ii2+1])=fat_available) then
-        begin
-         if(bool=false) then
-          begin
-           fs.fat32.fsinfo.nextfree:=i; bool:=true;
-          end;
-         inc(fs.fat32.fsinfo.freecount);
+         Delete(Result.FilePath,i-1,1); Delete(Result.FileShortStr,i-1,1);
+         Delete(Result.FileMainPos,i-1,1); Delete(Result.FileSubPos,i-1,1);
+         Delete(Result.FileClass,i-1,1);
+         if(fs.fsname=filesystem_fat32) then
+         Delete(Result.FileStructSize,i-1,1);
+         dec(Result.count);
         end;
        inc(i);
       end;
     end;
   end;
- genfs_filesystem_reset_name(fs,genfs_extract_filepath(destpath));
- genfs_write(fs);
 end;
-{File System Delete Item}
-procedure genfs_filesystem_delete(var fs:genfs_filesystem;delpath:UnicodeString);
-var inlist:genfs_inner_path;
-    temppath:UnicodeString;
-    tempindex:genfs_index_list;
-    templeft,tempright:SizeUint;
-    tempoffset:SizeUint;
-    ismask:boolean;
-    sdir:fat_directory_structure;
-    clearcontent:array[1..512] of byte;
-    copycontent:array[1..32] of byte;
-    i,j,k,ii1,ii2,tempnum1,tempnum2:SizeUint;
+{File System File Existence}
+function genfs_filesystem_check_file_existence(fs:genfs_filesystem;basedir:UnicodeString):boolean;
+var temppath:genfs_inner_path;
 begin
- for i:=1 to 512 do clearcontent[i]:=0;
- ismask:=genfs_is_mask(delpath);
- i:=length(delpath);
- while(delpath[i]<>'/') or (delpath[i]<>'\') do dec(i);
- temppath:=Copy(delpath,1,i-1);
- if(temppath='') then temppath:='/';
- inlist:=genfs_search_for_path(fs,temppath);
+ temppath:=genfs_filesystem_search_for_path(fs,basedir);
+ if(temppath.Count>0) then Result:=true else Result:=false;
+ SetLength(temppath.FilePath,0); SetLength(temppath.FileShortStr,0); SetLength(temppath.FileMainPos,0);
+ SetLength(temppath.FileSubPos,0); SetLength(temppath.FileClass,0); SetLength(temppath.FileStructSize,0);
+end;
+{FAT File Using Cluster acquire}
+function genfs_fat_get_using_cluster(fs:genfs_filesystem;startcluster:SizeUint):genfs_fat_cluster_list;
+var i:SizeUint;
+    entry:fat_entry;
+begin
+ i:=startcluster; Result.count:=0;
+ if(fs.fsname=filesystem_fat12) then
+  begin
+   entry:=genfs_fat_read_entry(fs,i);
+   if(fat12_check_cluster_status(entry.entry12)=fat_using) or
+   (fat12_check_cluster_status(entry.entry12)=fat_end) then
+    begin
+     inc(Result.count);
+     SetLength(Result.index,Result.count);
+     Result.index[Result.count-1]:=i;
+    end;
+   while(fat12_check_cluster_status(entry.entry12)=fat_using) do
+    begin
+     entry:=genfs_fat_read_entry(fs,entry.entry12);
+     if(fat12_check_cluster_status(entry.entry12)=fat_using) or
+     (fat12_check_cluster_status(entry.entry12)=fat_end) then
+      begin
+       inc(Result.count);
+       SetLength(Result.index,Result.count);
+       Result.index[Result.count-1]:=entry.entry12;
+      end;
+    end;
+  end
+ else if(fs.fsname=filesystem_fat16) then
+  begin
+   entry:=genfs_fat_read_entry(fs,i);
+   if(fat16_check_cluster_status(entry.entry16)=fat_using) or
+   (fat16_check_cluster_status(entry.entry16)=fat_end) then
+    begin
+     inc(Result.count);
+     SetLength(Result.index,Result.count);
+     Result.index[Result.count-1]:=i;
+    end;
+   while(fat16_check_cluster_status(entry.entry16)=fat_using) do
+    begin
+     entry:=genfs_fat_read_entry(fs,entry.entry16);
+     if(fat16_check_cluster_status(entry.entry16)=fat_using) or
+     (fat16_check_cluster_status(entry.entry16)=fat_end) then
+      begin
+       inc(Result.count);
+       SetLength(Result.index,Result.count);
+       Result.index[Result.count-1]:=entry.entry16;
+      end;
+    end;
+  end
+ else if(fs.fsname=filesystem_fat32) then
+  begin
+   entry:=genfs_fat_read_entry(fs,i);
+   if(fat32_check_cluster_status(entry.entry32)=fat_using) or
+   (fat32_check_cluster_status(entry.entry32)=fat_end) then
+    begin
+     inc(Result.count);
+     SetLength(Result.index,Result.count);
+     Result.index[Result.count-1]:=i;
+    end;
+   while(fat32_check_cluster_status(entry.entry32)=fat_using) do
+    begin
+     entry:=genfs_fat_read_entry(fs,entry.entry32);
+     if(fat32_check_cluster_status(entry.entry32)=fat_using) or
+     (fat32_check_cluster_status(entry.entry32)=fat_end) then
+      begin
+       inc(Result.count);
+       SetLength(Result.index,Result.count);
+       Result.index[Result.count-1]:=entry.entry32;
+      end;
+    end;
+  end
+ else exit(Result);
+end;
+{FAT Available acquire}
+function genfs_fat_get_available_cluster(fs:genfs_filesystem;needcount:SizeUint):genfs_fat_cluster_list;
+var i:SizeUint;
+    entry:fat_entry;
+begin
+ i:=2; Result.count:=0;
+ if(fs.fsname=filesystem_fat12) then
+  begin
+   while(i<=fs.fat12.entrycount)do
+    begin
+     entry:=genfs_fat_read_entry(fs,i);
+     if(fat12_check_cluster_status(entry.entry12)=fat_available) then
+      begin
+       inc(Result.count);
+       SetLength(Result.index,Result.count);
+       Result.index[Result.count-1]:=i;
+       if(Result.count>=needcount) then break;
+      end;
+     inc(i);
+    end;
+  end
+ else if(fs.fsname=filesystem_fat16) then
+  begin
+   while(i<=fs.fat16.entrycount)do
+    begin
+     entry:=genfs_fat_read_entry(fs,i);
+     if(fat16_check_cluster_status(entry.entry16)=fat_available) then
+      begin
+       inc(Result.count);
+       SetLength(Result.index,Result.count);
+       Result.index[Result.count-1]:=i;
+       if(Result.count>=needcount) then break;
+      end;
+     inc(i);
+    end;
+  end
+ else if(fs.fsname=filesystem_fat32) then
+  begin
+   while(i<=fs.fat32.entrycount)do
+    begin
+     entry:=genfs_fat_read_entry(fs,i);
+     if(fat32_check_cluster_status(entry.entry32)=fat_available) then
+      begin
+       inc(Result.count);
+       SetLength(Result.index,Result.count);
+       Result.index[Result.count-1]:=i;
+       if(Result.count>=needcount) then break;
+      end;
+     inc(i);
+    end;
+  end
+ else exit(Result);
+end;
+{FAT Cluster to file position}
+function genfs_fat_cluster_to_file_position(fs:genfs_filesystem;cluster:SizeUint):SizeUint;
+var tempnum1,tempnum2:SizeUint;
+begin
  if(fs.fsname=filesystem_fat12) then
   begin
    tempnum1:=fs.fat12.header.head.bpb_bytesPerSector;
    tempnum2:=fs.fat12.header.head.bpb_SectorPerCluster;
-   i:=inlist.Count;
-   while(i>0)do
-    begin
-     if(ismask) then
-      begin
-       if(genfs_mask_match(delpath,inlist.FilePath[i-1])) then
-        begin
-         genfs_io_read(fs,sdir,fs.fat12.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-         sizeof(fat_directory_structure),
-         sizeof(fat_directory_structure));
-         tempindex:=genfs_filesystem_get_using_cluster(fs,
-         sdir.directoryfirstclusterhighword shl 16+sdir.directoryfirstclusterlowword);
-         for j:=1 to tempindex.count do
-          begin
-           ii1:=tempindex.index[j-1] shr 1; ii2:=tempindex.index[j-1] mod 2;
-           if(ii2=0) then
-           (fs.fat12.entrypair+ii1)^.entry12.entry1:=0
-           else if(ii2=1) then
-           (fs.fat12.entrypair+ii1)^.entry12.entry2:=0;
-           tempoffset:=(tempindex.index[j-1]-2)*tempnum1*tempnum2;
-           k:=tempnum1*tempnum2 shr 9;
-           while(k>0)do
-            begin
-             genfs_io_write(fs,clearcontent,fs.fat12.datastart+(k-1) shl 9,512);
-             dec(k);
-            end;
-          end;
-         j:=1;
-         while(j<=inlist.count)do
-          begin
-           if(temppath=inlist.FilePath[j-1]) then break;
-           inc(j);
-          end;
-         tempoffset:=inlist.FileOffset[j-1];
-         genfs_io_read(fs,sdir,fs.fat12.datastart+inlist.FileOffset[j-1]+inlist.FileDirSize[j-1]-
-         sizeof(fat_directory_structure),sizeof(fat_directory_structure));
-         for j:=1 to sizeof(fat_directory_structure) do PByte(Pointer(@sdir)+j-1)^:=0;
-         Pbyte(@sdir)^:=$E5;
-         for j:=1 to inlist.FileDirSize[j-1] shr 5 do
-         genfs_io_write(fs,sdir,fs.fat12.datastart+inlist.FileOffset[j-1]+
-         (j-1)*sizeof(fat_directory_structure),sizeof(fat_directory_structure));
-        end;
-      end
-     else
-      begin
-       if(genfs_check_prefix(delpath,inlist.FilePath[i-1])) then
-        begin
-         genfs_io_read(fs,sdir,fs.fat12.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-         sizeof(fat_directory_structure),
-         sizeof(fat_directory_structure));
-         tempindex:=genfs_filesystem_get_using_cluster(fs,
-         sdir.directoryfirstclusterhighword shl 16+sdir.directoryfirstclusterlowword);
-         for j:=1 to tempindex.count do
-          begin
-           ii1:=tempindex.index[j-1] shr 1; ii2:=tempindex.index[j-1] mod 2;
-           if(ii2=0) then
-           (fs.fat12.entrypair+ii1)^.entry12.entry1:=0
-           else if(ii2=1) then
-           (fs.fat12.entrypair+ii1)^.entry12.entry2:=0;
-           tempoffset:=(tempindex.index[j-1]-2)*tempnum1*tempnum2;
-           k:=tempnum1*tempnum2 shr 9;
-           while(k>0)do
-            begin
-             genfs_io_write(fs,clearcontent,fs.fat12.datastart+(k-1) shl 9,512);
-             dec(k);
-            end;
-          end;
-         j:=1;
-         while(j<=inlist.count)do
-          begin
-           if(temppath=inlist.FilePath[j-1]) then break;
-           inc(j);
-          end;
-         tempoffset:=inlist.FileOffset[j-1];
-         genfs_io_read(fs,sdir,fs.fat12.datastart+inlist.FileOffset[j-1]+inlist.FileDirSize[j-1]-
-         sizeof(fat_directory_structure),sizeof(fat_directory_structure));
-         for j:=1 to sizeof(fat_directory_structure) do PByte(Pointer(@sdir)+j-1)^:=0;
-         Pbyte(@sdir)^:=$E5;
-         for j:=1 to inlist.FileDirSize[j-1] shr 5 do
-         genfs_io_write(fs,sdir,fs.fat12.datastart+inlist.FileOffset[j-1]+
-         (j-1)*sizeof(fat_directory_structure),sizeof(fat_directory_structure));
-        end;
-      end;
-     dec(i);
-    end;
+   Result:=fs.fat12.datastart+(cluster-2)*(tempnum1*tempnum2);
   end
  else if(fs.fsname=filesystem_fat16) then
   begin
    tempnum1:=fs.fat16.header.head.bpb_bytesPerSector;
    tempnum2:=fs.fat16.header.head.bpb_SectorPerCluster;
-   i:=inlist.Count;
-   while(i>0)do
-    begin
-     if(ismask) then
-      begin
-       if(genfs_mask_match(delpath,inlist.FilePath[i-1])) then
-        begin
-         genfs_io_read(fs,sdir,fs.fat16.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-         sizeof(fat_directory_structure),
-         sizeof(fat_directory_structure));
-         tempindex:=genfs_filesystem_get_using_cluster(fs,
-         sdir.directoryfirstclusterhighword shl 16+sdir.directoryfirstclusterlowword);
-         for j:=1 to tempindex.count do
-          begin
-           ii1:=tempindex.index[j-1] shr 1; ii2:=tempindex.index[j-1] mod 2;
-           (fs.fat16.entrypair+ii1)^.entry16[ii2+1]:=0;
-           tempoffset:=(tempindex.index[j-1]-2)*tempnum1*tempnum2;
-           k:=tempnum1*tempnum2 shr 9;
-           while(k>0)do
-            begin
-             genfs_io_write(fs,clearcontent,fs.fat16.datastart+(k-1) shl 9,512);
-             dec(k);
-            end;
-          end;
-         j:=1;
-         while(j<=inlist.count)do
-          begin
-           if(temppath=inlist.FilePath[j-1]) then break;
-           inc(j);
-          end;
-         tempoffset:=inlist.FileOffset[j-1];
-         genfs_io_read(fs,sdir,fs.fat16.datastart+inlist.FileOffset[j-1]+inlist.FileDirSize[j-1]-
-         sizeof(fat_directory_structure),sizeof(fat_directory_structure));
-         for j:=1 to sizeof(fat_directory_structure) do PByte(Pointer(@sdir)+j-1)^:=0;
-         Pbyte(@sdir)^:=$E5;
-         for j:=1 to inlist.FileDirSize[j-1] shr 5 do
-         genfs_io_write(fs,sdir,fs.fat12.datastart+inlist.FileOffset[j-1]+
-         (j-1)*sizeof(fat_directory_structure),sizeof(fat_directory_structure));
-        end;
-      end
-     else
-      begin
-       if(genfs_check_prefix(delpath,inlist.FilePath[i-1])) then
-        begin
-         genfs_io_read(fs,sdir,fs.fat16.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-         sizeof(fat_directory_structure),
-         sizeof(fat_directory_structure));
-         tempindex:=genfs_filesystem_get_using_cluster(fs,
-         sdir.directoryfirstclusterhighword shl 16+sdir.directoryfirstclusterlowword);
-         for j:=1 to tempindex.count do
-          begin
-           ii1:=tempindex.index[j-1] shr 1; ii2:=tempindex.index[j-1] mod 2;
-           (fs.fat16.entrypair+ii1)^.entry16[ii2+1]:=0;
-           tempoffset:=(tempindex.index[j-1]-2)*tempnum1*tempnum2;
-           k:=tempnum1*tempnum2 shr 9;
-           while(k>0)do
-            begin
-             genfs_io_write(fs,clearcontent,fs.fat16.datastart+(k-1) shl 9,512);
-             dec(k);
-            end;
-          end;
-         j:=1;
-         while(j<=inlist.count)do
-          begin
-           if(temppath=inlist.FilePath[j-1]) then break;
-           inc(j);
-          end;
-         tempoffset:=inlist.FileOffset[j-1];
-         genfs_io_read(fs,sdir,fs.fat16.datastart+inlist.FileOffset[j-1]+inlist.FileDirSize[j-1]-
-         sizeof(fat_directory_structure),sizeof(fat_directory_structure));
-         for j:=1 to sizeof(fat_directory_structure) do PByte(Pointer(@sdir)+j-1)^:=0;
-         Pbyte(@sdir)^:=$E5;
-         for j:=1 to inlist.FileDirSize[j-1] shr 5 do
-         genfs_io_write(fs,sdir,fs.fat12.datastart+inlist.FileOffset[j-1]+
-         (j-1)*sizeof(fat_directory_structure),sizeof(fat_directory_structure));
-        end;
-      end;
-     dec(i);
-    end;
+   Result:=fs.fat16.datastart+(cluster-2)*(tempnum1*tempnum2);
   end
  else if(fs.fsname=filesystem_fat32) then
   begin
    tempnum1:=fs.fat32.header.head.bpb_bytesPerSector;
    tempnum2:=fs.fat32.header.head.bpb_SectorPerCluster;
-   i:=inlist.Count;
-   while(i>0)do
+   Result:=fs.fat32.datastart+(cluster-2)*(tempnum1*tempnum2);
+  end;
+end;
+{FAT Location of File Info Position or New Directory Position}
+function genfs_fat_location_of_file_info(fs:genfs_filesystem;MainPos,SubPos,DirSize:SizeUint):genfs_fat_position_info;
+var templist:genfs_fat_cluster_list;
+    tempDirSize,tempnum1,tempnum2,index:SizeUint;
+begin
+ if(fs.fsname=filesystem_fat12) then
+  begin
+   tempnum1:=fs.fat12.header.head.bpb_bytesPerSector;
+   tempnum2:=fs.fat12.header.head.bpb_SectorPerCluster;
+  end
+ else if(fs.fsname=filesystem_fat16) then
+  begin
+   tempnum1:=fs.fat16.header.head.bpb_bytesPerSector;
+   tempnum2:=fs.fat16.header.head.bpb_SectorPerCluster;
+  end
+ else if(fs.fsname=filesystem_fat32) then
+  begin
+   tempnum1:=fs.fat32.header.head.bpb_bytesPerSector;
+   tempnum2:=fs.fat32.header.head.bpb_SectorPerCluster;
+  end;
+ templist:=genfs_fat_get_using_cluster(fs,MainPos);
+ tempDirSize:=SubPos*sizeof(fat_directory_structure)+DirSize*sizeof(fat_directory_structure); index:=1;
+ while(tempDirSize>tempnum1*tempnum2) and (index<templist.count) do
+  begin
+   inc(index);
+   dec(tempDirSize,tempnum1*tempnum2);
+  end;
+ Result.MainPos:=templist.index[index-1];
+ Result.SubPos:=tempDirSize div sizeof(fat_directory_structure);
+end;
+{FAT Next Directory Position List}
+function genfs_fat_location_of_next_directory_list(fs:genfs_filesystem;
+MainPos,SubPos,DirSize:SizeUint):genfs_fat_position_info_list;
+var templist:genfs_fat_cluster_list;
+    tempDirSize,tempnum1,tempnum2,index:SizeUint;
+begin
+ if(fs.fsname=filesystem_fat12) then
+  begin
+   tempnum1:=fs.fat12.header.head.bpb_bytesPerSector;
+   tempnum2:=fs.fat12.header.head.bpb_SectorPerCluster;
+  end
+ else if(fs.fsname=filesystem_fat16) then
+  begin
+   tempnum1:=fs.fat16.header.head.bpb_bytesPerSector;
+   tempnum2:=fs.fat16.header.head.bpb_SectorPerCluster;
+  end
+ else if(fs.fsname=filesystem_fat32) then
+  begin
+   tempnum1:=fs.fat32.header.head.bpb_bytesPerSector;
+   tempnum2:=fs.fat32.header.head.bpb_SectorPerCluster;
+  end;
+ tempDirSize:=SubPos*sizeof(fat_directory_structure)+DirSize*sizeof(fat_directory_structure);
+ index:=1; Result.count:=0;
+ templist:=genfs_fat_get_available_cluster(fs,tempdirsize div (tempnum1*tempnum2));
+ if(tempdirSize>0) then
+  begin
+   inc(Result.count);
+   SetLength(Result.item,Result.count);
+   SetLength(Result.size,Result.count);
+   Result.item[Result.count-1].MainPos:=MainPos;
+   Result.item[Result.count-1].SubPos:=SubPos;
+   Result.size[Result.count-1]:=tempdirSize div sizeof(fat_directory_structure)-SubPos;
+  end;
+ while(tempDirSize>tempnum1*tempnum2) and (index<templist.count) do
+  begin
+   inc(index);
+   dec(tempDirSize,tempnum1*tempnum2);
+   inc(Result.count);
+   SetLength(Result.item,Result.count);
+   SetLength(Result.size,Result.count);
+   Result.item[Result.count-1].MainPos:=templist.index[index-1];
+   Result.item[Result.count-1].SubPos:=0;
+   Result.size[Result.count-1]:=(tempnum1*tempnum2) div sizeof(fat_directory_structure);
+  end;
+ if(index>1) and (tempdirSize>0) then
+  begin
+   inc(Result.count);
+   SetLength(Result.item,Result.count);
+   SetLength(Result.size,Result.count);
+   Result.item[Result.count-1].MainPos:=templist.index[index-1];
+   Result.item[Result.count-1].SubPos:=0;
+   Result.size[Result.count-1]:=tempdirSize div sizeof(fat_directory_structure);
+  end;
+end;
+{FAT File System Get File Size}
+function genfs_fat_get_file_size(fs:genfs_filesystem;path:UnicodeString):SizeUint;
+var temppath:genfs_inner_path;
+    fatpos:genfs_fat_position_info;
+    PosInFile:SizeUint;
+    dircontent:array[1..32] of byte;
+    i:SizeUint;
+begin
+ temppath:=genfs_filesystem_search_for_path(fs); Result:=0; i:=1;
+ while(i<=temppath.Count)do
+  begin
+   if(temppath.FilePath[i-1]=path) then
     begin
-     if(ismask) then
-      begin
-       if(genfs_mask_match(delpath,inlist.FilePath[i-1])) then
-        begin
-         genfs_io_read(fs,sdir,fs.fat32.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-         sizeof(fat_directory_structure),
-         sizeof(fat_directory_structure));
-         tempindex:=genfs_filesystem_get_using_cluster(fs,
-         sdir.directoryfirstclusterhighword shl 32+sdir.directoryfirstclusterlowword);
-         for j:=1 to tempindex.count do
-          begin
-           ii1:=tempindex.index[j-1] shr 1; ii2:=tempindex.index[j-1] mod 2;
-           (fs.fat32.entrypair+ii1)^.entry32[ii2+1]:=0;
-           tempoffset:=(tempindex.index[j-1]-2)*tempnum1*tempnum2;
-           k:=tempnum1*tempnum2 shr 9;
-           while(k>0)do
-            begin
-             genfs_io_write(fs,clearcontent,fs.fat32.datastart+(k-1) shl 9,512);
-             dec(k);
-            end;
-          end;
-         j:=1;
-         while(j<=inlist.count)do
-          begin
-           if(temppath=inlist.FilePath[j-1]) then break;
-           inc(j);
-          end;
-         tempoffset:=inlist.FileOffset[j-1];
-         genfs_io_read(fs,sdir,fs.fat32.datastart+inlist.FileOffset[j-1]+inlist.FileDirSize[j-1]-
-         sizeof(fat_directory_structure),sizeof(fat_directory_structure));
-         for j:=1 to sizeof(fat_directory_structure) do PByte(Pointer(@sdir)+j-1)^:=0;
-         Pbyte(@sdir)^:=$E5;
-         for j:=1 to inlist.FileDirSize[j-1] shr 5 do
-         genfs_io_write(fs,sdir,fs.fat12.datastart+inlist.FileOffset[j-1]+
-         (j-1)*sizeof(fat_directory_structure),sizeof(fat_directory_structure));
-        end;
-      end
+     if(fs.fsname<=filesystem_fat16) then
+     fatpos:=genfs_fat_location_of_file_info(fs,temppath.FileMainPos[i-1],
+     temppath.FileSubPos[i-1],1)
      else
+     fatpos:=genfs_fat_location_of_file_info(fs,temppath.FileMainPos[i-1],
+     temppath.FileSubPos[i-1],temppath.FileStructSize[i-1]);
+     PosInFile:=genfs_fat_cluster_to_file_position(fs,fatpos.MainPos)+
+     (fatpos.SubPos-1)*sizeof(fat_directory_structure);
+     genfs_io_read(fs,dircontent,PosInFile,sizeof(fat_directory_structure));
+     Result:=Pfat_directory_structure(@dircontent)^.directoryfilesize;
+     break;
+    end;
+   inc(i);
+  end;
+end;
+{FAT File System Get File Cluster}
+function genfs_fat_get_file_cluster(fs:genfs_filesystem;path:UnicodeString):SizeUint;
+var temppath:genfs_inner_path;
+    fatpos:genfs_fat_position_info;
+    PosInFile:SizeUint;
+    dircontent:array[1..32] of byte;
+    i:SizeUint;
+begin
+ temppath:=genfs_filesystem_search_for_path(fs); Result:=0; i:=1;
+ while(i<=temppath.Count)do
+  begin
+   if(temppath.FilePath[i-1]=path) then
+    begin
+     if(fs.fsname<=filesystem_fat16) then
+     fatpos:=genfs_fat_location_of_file_info(fs,temppath.FileMainPos[i-1],
+     temppath.FileSubPos[i-1],1)
+     else
+     fatpos:=genfs_fat_location_of_file_info(fs,temppath.FileMainPos[i-1],
+     temppath.FileSubPos[i-1],temppath.FileStructSize[i-1]);
+     PosInFile:=genfs_fat_cluster_to_file_position(fs,fatpos.MainPos)+
+     (fatpos.SubPos-1)*sizeof(fat_directory_structure);
+     genfs_io_read(fs,dircontent,PosInFile,sizeof(fat_directory_structure));
+     Result:=Pfat_directory_structure(@dircontent)^.directoryfirstclusterhighword shl 16
+     +Pfat_directory_structure(@dircontent)^.directoryfirstclusterlowword;
+     break;
+    end;
+   inc(i);
+  end;
+end;
+{FAT File System Get File Size}
+function genfs_fat_get_file_attribute(fs:genfs_filesystem;path:UnicodeString):byte;
+var temppath:genfs_inner_path;
+    fatpos:genfs_fat_position_info;
+    PosInFile:SizeUint;
+    dircontent:array[1..32] of byte;
+    i:SizeUint;
+begin
+ temppath:=genfs_filesystem_search_for_path(fs); Result:=0; i:=1;
+ while(i<=temppath.Count)do
+  begin
+   if(temppath.FilePath[i-1]=path) then
+    begin
+     if(fs.fsname<=filesystem_fat16) then
+     fatpos:=genfs_fat_location_of_file_info(fs,temppath.FileMainPos[i-1],
+     temppath.FileSubPos[i-1],1)
+     else
+     fatpos:=genfs_fat_location_of_file_info(fs,temppath.FileMainPos[i-1],
+     temppath.FileSubPos[i-1],temppath.FileStructSize[i-1]);
+     PosInFile:=genfs_fat_cluster_to_file_position(fs,fatpos.MainPos)+
+     (fatpos.SubPos-1)*sizeof(fat_directory_structure);
+     genfs_io_read(fs,dircontent,PosInFile,sizeof(fat_directory_structure));
+     Result:=Pfat_directory_structure(@dircontent)^.directoryattribute;
+     break;
+    end;
+   inc(i);
+  end;
+end;
+{FAT File System Next Cluster of Directory}
+function genfs_fat_get_directory_cluster(fs:genfs_filesystem;path:UnicodeString):SizeUint;
+var temppath:genfs_inner_path;
+    fatpos:genfs_fat_position_info;
+    PosInFile:SizeUint;
+    dircontent:array[1..32] of byte;
+    i:SizeUint;
+begin
+ temppath:=genfs_filesystem_search_for_path(fs); Result:=0; i:=1;
+ while(i<=temppath.Count)do
+  begin
+   if(temppath.FilePath[i-1]=path) then
+    begin
+     if(fs.fsname<=filesystem_fat16) then
+     fatpos:=genfs_fat_location_of_file_info(fs,temppath.FileMainPos[i-1],
+     temppath.FileSubPos[i-1],1)
+     else
+     fatpos:=genfs_fat_location_of_file_info(fs,temppath.FileMainPos[i-1],
+     temppath.FileSubPos[i-1],temppath.FileStructSize[i-1]);
+     PosInFile:=genfs_fat_cluster_to_file_position(fs,fatpos.MainPos)+
+     (fatpos.SubPos-1)*sizeof(fat_directory_structure);
+     genfs_io_read(fs,dircontent,PosInFile,sizeof(fat_directory_structure));
+     Result:=Pfat_directory_structure(@dircontent)^.directoryfirstclusterhighword shl 16
+     +Pfat_directory_structure(@dircontent)^.directoryfirstclusterlowword;
+     break;
+    end;
+   inc(i);
+  end;
+end;
+{File System File Add Operation}
+procedure genfs_filesystem_add_file(var fs:genfs_filesystem;srcdir:UnicodeString;destdir:UnicodeString);
+var temppath:genfs_inner_path;
+    extpath:genfs_path;
+    pathstr:genfs_path_string;
+    destpath:UnicodeString;
+    i,j,k,m,n:SizeUint;
+    addcontent:array[1..512] of byte;
+    BytePerSector,SectorPerCluster:SizeUint;
+{These are for external path parsing}
+    rootpath:UnicodeString;
+    rootlen:SizeUint;
+{These are FAT File System Only}
+    tempstr:PWideChar;
+    tempsize:SizeUint;
+    fatentry:fat_entry;
+    fatstr:fat_string;
+    FatDir:fat_directory;
+    TotalPath:UnicodeString;
+    fatpos:genfs_fat_position_info;
+    fatposlist:genfs_fat_position_info_list;
+    fatavailablelist:genfs_fat_cluster_list;
+    PosInFile:SizeUint;
+    CurCluster,PrevCluster:SizeUint;
+    HavePrevNext:boolean;
+begin
+ for i:=1 to 512 do addcontent[i]:=0;
+ temppath:=genfs_filesystem_search_for_path(fs);
+ extpath:=genfs_external_search_for_path(srcdir);
+ if(extpath.count=0) then
+  begin
+   writeln('ERROR:No file or directory exists in source file path.');
+   readln;
+   abort;
+  end;
+ fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+ fatdir.longdir:=nil; fatdir.longdircount:=0;
+ if(FileExists(srcdir)) then
+  begin
+   rootpath:=genfs_extract_file_path(srcdir); rootlen:=length(rootpath)+1;
+  end
+ else
+  begin
+   rootpath:=genfs_extract_search_path_without_wildcard(srcdir); rootlen:=length(rootpath)+1;
+  end;
+ i:=1;
+ while(i<=extpath.count)do
+  begin
+   if(destdir='/') or (destdir='\') then
+   destpath:=destdir+Copy(extpath.FilePath[i-1],rootlen+1,length(extpath.FilePath[i-1])-rootlen)
+   else if(length(destdir)>0) and ((destdir[length(destdir)]='/') or (destdir[length(destdir)]='\')) then
+   destpath:=destdir+Copy(extpath.FilePath[i-1],rootlen+1,length(extpath.FilePath[i-1])-rootlen)
+   else if(genfs_check_file_name(destdir)) then
+   destpath:=destdir
+   else if(length(rootpath)<>length(srcdir)) then
+   destpath:=destdir+'/'+Copy(extpath.FilePath[i-1],rootlen+1,length(extpath.FilePath[i-1])-rootlen)
+   else
+   destpath:=destdir;
+   pathstr:=genfs_path_to_path_string(destpath);
+   j:=1; TotalPath:='/';
+   PrevCluster:=2;
+   if(fs.fsname=filesystem_fat12) then CurCluster:=2
+   else if(fs.fsname=filesystem_fat16) then CurCluster:=2
+   else if(fs.fsname=filesystem_fat32) then CurCluster:=fs.fat32.header.exthead.bpb_rootcluster;
+   while(j<=pathstr.count)do
+    begin
+     if(fs.fsname<=filesystem_fat32) then
       begin
-       if(genfs_check_prefix(delpath,inlist.FilePath[i-1])) then
+       k:=1; HavePrevNext:=false;
+       while(k<=temppath.Count)do
         begin
-         genfs_io_read(fs,sdir,fs.fat32.datastart+inlist.FileOffset[i-1]+inlist.FileDirSize[i-1]-
-         sizeof(fat_directory_structure),
-         sizeof(fat_directory_structure));
-         tempindex:=genfs_filesystem_get_using_cluster(fs,
-         sdir.directoryfirstclusterhighword shl 32+sdir.directoryfirstclusterlowword);
-         for j:=1 to tempindex.count do
+         if((j=1) and (TotalPath+pathstr.path[j-1]=temppath.FilePath[k-1]))
+         or((j>1) and (TotalPath+'/'+pathstr.path[j-1]=temppath.FilePath[k-1]))then
           begin
-           ii1:=tempindex.index[j-1] shr 1; ii2:=tempindex.index[j-1] mod 2;
-           (fs.fat32.entrypair+ii1)^.entry32[ii2+1]:=0;
-           tempoffset:=(tempindex.index[j-1]-2)*tempnum1*tempnum2;
-           k:=tempnum1*tempnum2 shr 9;
-           while(k>0)do
+           if(fs.fsname<=filesystem_fat16) then
+           fatpos:=genfs_fat_location_of_file_info(fs,temppath.FileMainPos[k-1],
+           temppath.FileSubPos[k-1],1)
+           else
+           fatpos:=genfs_fat_location_of_file_info(fs,temppath.FileMainPos[k-1],
+           temppath.FileSubPos[k-1],temppath.FileStructSize[k-1]);
+           PosInFile:=genfs_fat_cluster_to_file_position(fs,fatpos.MainPos)+
+           (fatpos.SubPos-1)*sizeof(fat_directory_structure);
+           genfs_io_read(fs,addcontent,PosInFile,sizeof(fat_directory_structure));
+           if(fs.fsname=filesystem_fat32) and
+           (fat_get_file_class(Pfat_directory_structure(@addcontent)^.directoryattribute,
+           temppath.FileStructSize[k-1]>1)
+           and fat_directory_directory=fat_directory_directory) then
             begin
-             genfs_io_write(fs,clearcontent,fs.fat32.datastart+(k-1) shl 9,512);
-             dec(k);
+             CurCluster:=Pfat_directory_structure(@addcontent)^.directoryfirstclusterhighword shl 16
+             +Pfat_directory_structure(@addcontent)^.directoryfirstclusterlowword;
+            end
+           else if(fs.fsname<=filesystem_fat16) and
+           (fat_get_file_class(Pfat_directory_structure(@addcontent)^.directoryattribute,false)
+           and fat_directory_directory=fat_directory_directory) then
+            begin
+             CurCluster:=Pfat_directory_structure(@addcontent)^.directoryfirstclusterhighword shl 16
+             +Pfat_directory_structure(@addcontent)^.directoryfirstclusterlowword;
+            end;
+           break;
+          end
+         else if(genfs_check_prefix(TotalPath,temppath.FilePath[k-1],true)) then
+          begin
+           if(j>1) then HavePrevNext:=true;
+           if(fs.fsname<=filesystem_fat16) then
+           fatpos:=genfs_fat_location_of_file_info(fs,temppath.FileMainPos[k-1],
+           temppath.FileSubPos[k-1],1)
+           else
+           fatpos:=genfs_fat_location_of_file_info(fs,temppath.FileMainPos[k-1],
+           temppath.FileSubPos[k-1],temppath.FileStructSize[k-1]);
+          end;
+         inc(k);
+        end;
+       if(k<=temppath.count) then
+        begin
+         PrevCluster:=CurCluster;
+         if(TotalPath='/') or (TotalPath='\') then TotalPath:=TotalPath+pathstr.path[j-1]
+         else TotalPath:=TotalPath+'/'+pathstr.path[j-1];
+         inc(j);
+         continue;
+        end
+       else
+        begin
+         fatavailablelist:=genfs_fat_get_available_cluster(fs,1);
+         if(fatavailablelist.count=0) then
+          begin
+           writeln('ERROR:FAT FileSystem Write out of size.');
+           readln;
+           abort;
+          end;
+         CurCluster:=fatavailablelist.index[0];
+         fatpos.MainPos:=CurCluster; fatpos.SubPos:=0;
+        end;
+       if(j>1) and (HavePrevNext=false) then
+        begin
+         fatstr:=fat_PWideCharToFatString('.');
+         fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory,
+         genfs_date_to_fat_date,genfs_time_to_fat_time,0,fatpos.MainPos);
+         PosInFile:=genfs_fat_cluster_to_file_position(fs,curcluster);
+         genfs_io_write(fs,fatdir.dir,PosInFile,sizeof(fat_directory_structure));
+         fatstr:=fat_PWideCharToFatString('..');
+         fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory,
+         genfs_date_to_fat_date,genfs_time_to_fat_time,0,PrevCluster);
+         PosInFile:=genfs_fat_cluster_to_file_position(fs,curcluster)+sizeof(fat_directory_structure);
+         genfs_io_write(fs,fatdir.dir,PosInFile,sizeof(fat_directory_structure));
+         if(fs.fsname<=filesystem_fat12) then fatentry.entry12:=fat12_final_cluster_low
+         else if(fs.fsname<=filesystem_fat16) then fatentry.entry16:=fat16_final_cluster_low
+         else if(fs.fsname<=filesystem_fat32) then fatentry.entry32:=fat32_final_cluster_low;
+         genfs_fat_write_entry(fs,fatentry,CurCluster);
+         if(fs.fsname=filesystem_fat32) then
+          begin
+           dec(fs.fat32.fsinfo.freecount,1);
+           fatavailablelist:=genfs_fat_get_available_cluster(fs,1);
+           if(fatavailablelist.count=0) then
+            begin
+             writeln('ERROR:File System cannot allocate more cluster to new information.');
+             readln;
+             abort;
+            end;
+           fs.fat32.fsinfo.nextfree:=fatavailablelist.index[0];
+          end;
+         inc(fatpos.subpos,2);
+         PrevCluster:=CurCluster;
+        end;
+        tempstr:=UnicodeStringToPWideChar(pathstr.path[j-1]);
+        fatstr:=fat_PWideCharToFatString(tempstr);
+        if(extpath.IsFile[i-1]) and (j=pathstr.count) then
+        tempsize:=genfs_external_file_size(extpath.FilePath[i-1])
+        else tempsize:=0;
+        if(fs.fsname<=filesystem_fat16) and (HavePrevNext=false) then
+        fatposlist:=genfs_fat_location_of_next_directory_list(fs,fatpos.MainPos,fatpos.SubPos,1)
+        else
+        fatposlist:=genfs_fat_location_of_next_directory_list(fs,fatpos.MainPos,fatpos.SubPos,
+        fat_calculate_directory_size(tempstr) div sizeof(fat_directory_structure));
+        {Generate new cluster for File System}
+        fatavailablelist.count:=0;
+        if(fatposlist.count=1) and (fatpos.MainPos<>fatposlist.item[0].MainPos) and (j>1) then
+        fatavailablelist:=genfs_fat_get_available_cluster(fs,2)
+        else if(fatposlist.count=1) and (fatpos.MainPos<>fatposlist.item[0].MainPos) then
+        fatavailablelist:=genfs_fat_get_available_cluster(fs,3)
+        else if(fatposlist.count=1) and (j>1) then
+        fatavailablelist:=genfs_fat_get_available_cluster(fs,1)
+        else if(fatposlist.count=1) then
+        fatavailablelist:=genfs_fat_get_available_cluster(fs,2)
+        else
+        fatavailablelist:=genfs_fat_get_available_cluster(fs,fatposlist.count+1);
+        if(fatavailablelist.count>0) then
+         begin
+          CurCluster:=fatavailablelist.index[fatavailablelist.count-1];
+          dec(fs.fat32.fsinfo.freecount,fatavailablelist.count-1);
+          fs.fat32.fsinfo.nextfree:=fatavailablelist.index[fatavailablelist.count-1];
+         end
+        else
+         begin
+          writeln('ERROR:File System cannot allocate more cluster to new information.');
+          readln;
+          abort;
+         end;
+        if(fs.fsname<=filesystem_fat16) or (fatstr.unicodefncount=0) then
+         begin
+          if(extpath.IsFile[i-1]) and (j=pathstr.count) and
+          (genfs_external_file_size(extpath.FilePath[i-1])=0) then
+          fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory,
+          genfs_date_to_fat_date,genfs_time_to_fat_time,0,0)
+          else if(extpath.IsFile[i-1]) and (j=pathstr.count) then
+          fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_file,
+          genfs_date_to_fat_date,genfs_time_to_fat_time,tempsize,CurCluster)
+          else
+          fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory,
+          genfs_date_to_fat_date,genfs_time_to_fat_time,0,CurCluster);
+         end
+        else
+         begin
+          if(extpath.IsFile[i-1]) and (j=pathstr.count) and
+          (genfs_external_file_size(extpath.FilePath[i-1])=0) then
+          fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory or fat_directory_long,
+          genfs_date_to_fat_date,genfs_time_to_fat_time,0,0)
+          else if(extpath.IsFile[i-1]) and (j=pathstr.count) then
+          fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_file or fat_directory_long,
+          genfs_date_to_fat_date,genfs_time_to_fat_time,tempsize,CurCluster)
+          else
+          fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory or fat_directory_long,
+          genfs_date_to_fat_date,genfs_time_to_fat_time,0,CurCluster);
+         end;
+        if(fatstr.unicodefn<>nil) then
+         begin
+          FreeMem(fatstr.unicodefn); fatstr.unicodefncount:=0; fatstr.unicodefn:=nil;
+         end;
+        {Add File infomation to the File System}
+        if(j>1) and (HavePrevNext=false) then
+         begin
+          inc(temppath.Count);
+          SetLength(temppath.FileClass,temppath.count);
+          temppath.FileClass[temppath.count-1]:=fat_directory_directory;
+          SetLength(temppath.FilePath,temppath.count);
+          if(TotalPath='/') or (TotalPath='\') then
+          temppath.FilePath[temppath.count-1]:=TotalPath+'.'
+          else
+          temppath.FilePath[temppath.count-1]:=TotalPath+'/.';
+          SetLength(temppath.FileMainPos,temppath.count);
+          temppath.FileMainPos[temppath.count-1]:=fatpos.MainPos;
+          SetLength(temppath.FileSubPos,temppath.count);
+          temppath.FileSubPos[temppath.count-1]:=0;
+          SetLength(temppath.FileShortStr,temppath.count);
+          temppath.FileShortStr[temppath.count-1]:='.';
+          if(fs.fsname=filesystem_fat32) then
+           begin
+            SetLength(temppath.FileStructSize,temppath.count);
+            temppath.FileStructSize[temppath.count-1]:=1;
+           end;
+          inc(temppath.Count);
+          SetLength(temppath.FileClass,temppath.count);
+          temppath.FileClass[temppath.count-1]:=fat_directory_directory;
+          SetLength(temppath.FilePath,temppath.count);
+          if(TotalPath='/') or (TotalPath='\') then
+          temppath.FilePath[temppath.count-1]:=TotalPath+'..'
+          else
+          temppath.FilePath[temppath.count-1]:=TotalPath+'/..';
+          SetLength(temppath.FileMainPos,temppath.count);
+          temppath.FileMainPos[temppath.count-1]:=fatpos.MainPos;
+          SetLength(temppath.FileSubPos,temppath.count);
+          temppath.FileSubPos[temppath.count-1]:=1;
+          SetLength(temppath.FileShortStr,temppath.count);
+          temppath.FileShortStr[temppath.count-1]:='..';
+          if(fs.fsname=filesystem_fat32) then
+           begin
+            SetLength(temppath.FileStructSize,temppath.count);
+            temppath.FileStructSize[temppath.count-1]:=1;
+           end;
+         end;
+        inc(temppath.Count);
+        SetLength(temppath.FileClass,temppath.count);
+        SetLength(temppath.FilePath,temppath.count);
+        SetLength(temppath.FileMainPos,temppath.count);
+        SetLength(temppath.FileSubPos,temppath.count);
+        SetLength(temppath.FileShortStr,temppath.count);
+        if(fs.fsname=filesystem_fat32) then SetLength(temppath.FileStructSize,temppath.count);
+        if(fatdir.longdircount>0) and (fs.fsname=filesystem_fat32) then
+         begin
+          if(j<pathstr.count) or (extpath.IsFile[i-1]=false) then
+          temppath.FileClass[temppath.count-1]:=fat_directory_directory and
+          fat_directory_long
+          else
+          temppath.FileClass[temppath.count-1]:=fat_directory_file and
+          fat_directory_long;
+          if(TotalPath='/') or (TotalPath='\') then
+          temppath.FilePath[temppath.count-1]:=TotalPath+pathstr.path[j-1]
+          else
+          temppath.FilePath[temppath.count-1]:=TotalPath+'/'+pathstr.path[j-1];
+          temppath.FileMainPos[temppath.count-1]:=fatpos.MainPos;
+          temppath.FileSubPos[temppath.count-1]:=fatpos.SubPos;
+          temppath.FileShortStr[temppath.count-1]:=genfs_fat_extract_short_name(fatdir.dir);
+          temppath.FileStructSize[temppath.count-1]:=fatdir.longdircount+1;
+         end
+        else
+         begin
+          if(j<pathstr.count) then
+          temppath.FileClass[temppath.count-1]:=fat_directory_directory
+          else
+          temppath.FileClass[temppath.count-1]:=fat_directory_file;
+          if(TotalPath='/') or (TotalPath='\') then
+          temppath.FilePath[temppath.count-1]:=TotalPath+pathstr.path[j-1]
+          else
+          temppath.FilePath[temppath.count-1]:=TotalPath+'/'+pathstr.path[j-1];
+          temppath.FileMainPos[temppath.count-1]:=fatpos.MainPos;
+          temppath.FileSubPos[temppath.count-1]:=fatpos.SubPos;
+          temppath.FileShortStr[temppath.count-1]:=genfs_fat_extract_short_name(fatdir.dir);
+          if(fs.fsname=filesystem_fat32) then
+          temppath.FileStructSize[temppath.count-1]:=1;
+         end;
+        {Generate the missing directory}
+        n:=1;
+        for k:=1 to fatposlist.count do
+         begin
+          if(k<fatposlist.count) then
+           begin
+            if(fs.fsname<=filesystem_fat12) then
+            fatentry.entry12:=fatposlist.item[k].MainPos
+            else if(fs.fsname<=filesystem_fat16) then
+            fatentry.entry16:=fatposlist.item[k].MainPos
+            else if(fs.fsname<=filesystem_fat32) then
+            fatentry.entry32:=fatposlist.item[k].MainPos;
+            genfs_fat_write_entry(fs,fatentry,fatposlist.item[k-1].MainPos);
+           end
+          else
+           begin
+            if(fs.fsname<=filesystem_fat12) then
+            fatentry.entry12:=fat12_final_cluster_low
+            else if(fs.fsname<=filesystem_fat16) then
+            fatentry.entry16:=fat16_final_cluster_low
+            else if(fs.fsname<=filesystem_fat32) then
+            fatentry.entry32:=fat32_final_cluster_low;
+            genfs_fat_write_entry(fs,fatentry,fatposlist.item[k-1].MainPos);
+           end;
+          for m:=1 to fatposlist.size[k-1] do
+           begin
+            PosInFile:=genfs_fat_cluster_to_file_position(fs,fatposlist.item[k-1].MainPos)+
+            (fatposlist.item[k-1].SubPos+m-1)*sizeof(fat_directory_structure);
+            if(fs.fsname=filesystem_fat32) and (n<=fatdir.longdircount) then
+            genfs_io_write(fs,(fatdir.longdir+n-1)^,PosInFile,sizeof(fat_long_directory_structure))
+            else
+            genfs_io_write(fs,fatdir.dir,PosInFile,sizeof(fat_long_directory_structure));
+            inc(n);
+           end;
+         end;
+        if(fatdir.longdircount>0) then
+         begin
+          FreeMem(fatdir.longdir); fatdir.longdir:=nil; fatdir.longdircount:=0;
+         end;
+        FreeMem(tempstr);
+       if(j=pathstr.Count) and (extpath.IsFile[i-1]) then
+        begin
+         {Move the file into File System}
+         BytePerSector:=fs.fat12.header.head.bpb_bytesPerSector;
+         SectorPerCluster:=fs.fat12.header.head.bpb_SectorPerCluster;
+         tempsize:=genfs_external_file_size(extpath.FilePath[i-1]);
+         fatavailablelist:=genfs_fat_get_available_cluster(fs,(tempsize+BytePerSector*
+         SectorPerCluster-1) div (BytePerSector*SectorPerCluster)+1);
+         if(fatavailablelist.count=(tempsize+BytePerSector*
+         SectorPerCluster-1) div (BytePerSector*SectorPerCluster)) then
+         n:=fatavailablelist.count+1
+         else if(fatavailablelist.count=(tempsize+BytePerSector*
+         SectorPerCluster-1) div (BytePerSector*SectorPerCluster)+1) then
+         n:=fatavailablelist.count
+         else
+          begin
+           writeln('ERROR:Out of disk free space.');
+           readln;
+           abort;
+          end;
+         for k:=1 to n-1 do
+          begin
+           PosInFile:=genfs_fat_cluster_to_file_position(fs,fatavailablelist.index[k-1]);
+           if(k<n-1) then
+           begin
+            if(fs.fsname<=filesystem_fat12) then
+            fatentry.entry12:=fatavailablelist.index[k]
+            else if(fs.fsname<=filesystem_fat16) then
+            fatentry.entry16:=fatavailablelist.index[k]
+            else if(fs.fsname<=filesystem_fat32) then
+            fatentry.entry32:=fatavailablelist.index[k];
+            genfs_fat_write_entry(fs,fatentry,fatavailablelist.index[k-1]);
+           end
+          else
+           begin
+            if(fs.fsname<=filesystem_fat12) then
+            fatentry.entry12:=fat12_final_cluster_low
+            else if(fs.fsname<=filesystem_fat16) then
+            fatentry.entry16:=fat16_final_cluster_low
+            else if(fs.fsname<=filesystem_fat32) then
+            fatentry.entry32:=fat32_final_cluster_low;
+            genfs_fat_write_entry(fs,fatentry,fatavailablelist.index[k-1]);
+           end;
+           if(tempsize>0) then
+            begin
+             for m:=1 to (BytePerSector*SectorPerCluster) shr 9 do
+              begin
+               if(tempsize>=1 shl 9) then
+                begin
+                 genfs_external_io_read(extpath.FilePath[i-1],addcontent,
+                 (k-1)*(BytePerSector*SectorPerCluster)+(m-1) shl 9,1 shl 9);
+                 genfs_io_write(fs,addcontent,PosInFile+(m-1) shl 9,1 shl 9);
+                end
+               else
+                begin
+                 genfs_external_io_read(extpath.FilePath[i-1],addcontent,
+                 (k-1)*(BytePerSector*SectorPerCluster)+(m-1) shl 9,tempsize);
+                 genfs_io_write(fs,addcontent,PosInFile+(m-1) shl 9,tempsize);
+                 tempsize:=0;
+                 break;
+                end;
+               dec(tempsize,1 shl 9);
+              end;
             end;
           end;
-         j:=1;
-         while(j<=inlist.count)do
+         if(n=fatavailablelist.count+1) and (fs.fsname=filesystem_fat32) then
           begin
-           if(temppath=inlist.FilePath[j-1]) then break;
-           inc(j);
+           fs.fat32.fsinfo.freecount:=0;
+           fs.fat32.fsinfo.nextfree:=fatavailablelist.index[n-2]+1;
+          end
+         else if(fs.fsname=filesystem_fat32) then
+          begin
+           dec(fs.fat32.fsinfo.freecount,fatposlist.count);
+           fs.fat32.fsinfo.nextfree:=fatavailablelist.index[fatavailablelist.count-1];
           end;
-         tempoffset:=inlist.FileOffset[j-1];
-         genfs_io_read(fs,sdir,fs.fat32.datastart+inlist.FileOffset[j-1]+inlist.FileDirSize[j-1]-
-         sizeof(fat_directory_structure),sizeof(fat_directory_structure));
-         for j:=1 to sizeof(fat_directory_structure) do PByte(Pointer(@sdir)+j-1)^:=0;
-         Pbyte(@sdir)^:=$E5;
-         for j:=1 to inlist.FileDirSize[j-1] shr 5 do
-         genfs_io_write(fs,sdir,fs.fat12.datastart+inlist.FileOffset[j-1]+
-         (j-1)*sizeof(fat_directory_structure),sizeof(fat_directory_structure));
         end;
       end;
-     dec(i);
+     if(TotalPath='/') or (TotalPath='\') then TotalPath:=TotalPath+pathstr.path[j-1]
+     else TotalPath:=TotalPath+'/'+pathstr.path[j-1];
+     inc(j);
+    end;
+   inc(i);
+  end;
+ genfs_filesystem_write_info(fs);
+end;
+{File System File Copy Operation}
+procedure genfs_filesystem_copy_file(var fs:genfs_filesystem;srcdir:UnicodeString;destdir:UnicodeString);
+var srcpath,totalpath:genfs_inner_path;
+    temppath,finaldestdir,searchpath:UnicodeString;
+    rootpath:UnicodeString;
+    pathstr:genfs_path_string;
+    copycontent:array[1..512] of byte;
+    i,j,k,m,n,len,rootlen:SizeUint;
+    ismask:boolean;
+    PosInFile:SizeUint;
+    tempsize:SizeUint;
+    tempcluster:SizeUint;
+    Ptr1,Ptr2:SizeUint;
+{Only for FAT FileSystem}
+    BytePerSector,SectorPerCluster:SizeUint;
+    tempstr:PWideChar;
+    FATstr:fat_string;
+    FATdir:fat_directory;
+    FATPos:genfs_fat_position_info;
+    FATAlist,FATUlist:genfs_fat_cluster_list;
+    FATPoslist:genfs_fat_position_info_list;
+    CurCluster,PrevCluster:SizeUint;
+    HavePrevNext:boolean;
+    FATentry:fat_entry;
+begin
+ if(srcdir=destdir) then exit;
+ for i:=1 to 512 do copycontent[i]:=0;
+ totalpath:=genfs_filesystem_search_for_path(fs);
+ ismask:=genfs_is_mask(srcdir); srcpath.count:=0;
+ if(fs.fsname<=filesystem_fat32) then
+  begin
+   FATstr.unicodefn:=nil; FATStr.unicodefncount:=0;
+   FATdir.longdir:=nil; FATdir.longdircount:=0;
+  end;
+ if(fs.fsname<=filesystem_fat16) then CurCluster:=2
+ else if(fs.fsname=filesystem_fat32) then CurCluster:=fs.fat32.header.exthead.bpb_rootcluster;
+ {Generate the Source Directory Path}
+ for i:=1 to totalpath.Count do
+  begin
+   if((ismask) and (genfs_mask_match(srcdir,totalpath.FilePath[i-1]))) or
+   ((ismask=false) and (genfs_check_prefix(srcdir,totalpath.FilePath[i-1]))) then
+    begin
+     inc(srcpath.Count);
+     SetLength(srcpath.FilePath,srcpath.Count);
+     SetLength(srcpath.FileClass,srcpath.Count);
+     SetLength(srcpath.FileMainPos,srcpath.Count);
+     SetLength(srcpath.FileSubPos,srcpath.Count);
+     if(fs.fsname<=filesystem_fat32) then SetLength(srcpath.FileShortStr,srcpath.Count);
+     if(fs.fsname=filesystem_fat32) then SetLength(srcpath.FileStructSize,srcpath.Count);
+     srcpath.FilePath[srcpath.count-1]:=totalpath.FilePath[i-1];
+     srcpath.FileClass[srcpath.count-1]:=totalpath.FileClass[i-1];
+     srcpath.FileMainPos[srcpath.count-1]:=totalpath.FileMainPos[i-1];
+     srcpath.FileSubPos[srcpath.count-1]:=totalpath.FileSubPos[i-1];
+     if(fs.fsname<=filesystem_fat16) then
+     srcpath.FileShortStr[srcpath.count-1]:=totalpath.FileShortStr[i-1];
+     if(fs.fsname=filesystem_fat32) then
+     srcpath.FileStructSize[srcpath.count-1]:=totalpath.FileStructSize[i-1];
+    end
+   else if(destdir=totalpath.FilePath[i-1]) and (fs.fsname<=filesystem_fat16) then
+    begin
+     FATPos:=genfs_fat_location_of_file_info(fs,
+     totalpath.FileMainPos[i-1],totalpath.FileSubPos[i-1],1);
+    end
+   else if(destdir=totalpath.FilePath[i-1]) and (fs.fsname=filesystem_fat32) then
+    begin
+     FATPos:=genfs_fat_location_of_file_info(fs,
+     totalpath.FileMainPos[i-1],totalpath.FileSubPos[i-1],totalPath.FileStructSize[i-1]);
+    end
+  end;
+ if(srcpath.count=0) then
+  begin
+   writeln('ERROR:No file or directory exists in specified path.');
+   readln;
+   abort;
+  end;
+ if(ismask) then
+  begin
+   rootpath:=genfs_extract_search_path_without_wildcard(srcdir); rootlen:=length(rootpath);
+  end
+ else
+  begin
+   rootpath:=genfs_extract_file_path(srcdir); rootlen:=length(rootpath);
+  end;
+ if((destdir='/') or (destdir='\')) and (fs.fsname<=filesystem_fat32) then
+  begin
+   FATPos:=genfs_fat_location_of_file_info(fs,
+   totalpath.FileMainPos[i-1],totalpath.FileSubPos[i-1],totalPath.FileStructSize[i-1]);
+  end;
+ {Initialize the Final Destination Path}
+ len:=length(destdir);
+ if((destdir='/') or (destdir='\')) then finaldestdir:=''
+ else if(len>1) and ((destdir[len]='/') or (destdir[len]='\')) then finaldestdir:=Copy(destdir,1,len-1)
+ else finaldestdir:=destdir;
+ {Create the file copied to}
+ for i:=1 to srcpath.Count do
+  begin
+   if(genfs_check_file_name(finaldestdir)) then
+   temppath:=finaldestdir
+   else
+   temppath:=finaldestdir+'/'+Copy(srcpath.FilePath[i-1],rootlen+1,length(srcpath.FilePath[i-1])-rootlen);
+   pathstr:=genfs_path_to_path_string(temppath);
+   searchpath:='/';
+   if(fs.fsname=filesystem_fat12) then CurCluster:=2
+   else if(fs.fsname=filesystem_fat16) then CurCluster:=2
+   else if(fs.fsname=filesystem_fat32) then CurCluster:=fs.fat32.header.exthead.bpb_rootcluster;
+   PrevCluster:=CurCluster;
+   j:=1;
+   while(j<=pathstr.count)do
+    begin
+     if(fs.fsname<=filesystem_fat32) then
+      begin
+       k:=1; HavePrevNext:=false;
+       while(k<=totalpath.count)do
+        begin
+         if((j=1) and (searchpath+pathstr.path[j-1]=totalpath.FilePath[k-1]))
+         or((j>1) and (searchpath+'/'+pathstr.path[j-1]=totalpath.FilePath[k-1]))then
+          begin
+           if(fs.fsname<=filesystem_fat16) then
+           fatpos:=genfs_fat_location_of_file_info(fs,totalpath.FileMainPos[k-1],
+           totalpath.FileSubPos[k-1],1)
+           else
+           fatpos:=genfs_fat_location_of_file_info(fs,totalpath.FileMainPos[k-1],
+           totalpath.FileSubPos[k-1],totalpath.FileStructSize[k-1]);
+           PosInFile:=genfs_fat_cluster_to_file_position(fs,fatpos.MainPos)+
+           (fatpos.SubPos-1)*sizeof(fat_directory_structure);
+           genfs_io_read(fs,copycontent,PosInFile,sizeof(fat_directory_structure));
+           if((fs.fsname<=filesystem_fat16) and
+           (fat_get_file_class(Pfat_directory_structure(@copycontent)^.directoryattribute,false)
+           and fat_directory_directory=fat_directory_directory)) or
+           ((fs.fsname=filesystem_fat32) and
+           (fat_get_file_class(Pfat_directory_structure(@copycontent)^.directoryattribute,
+           totalpath.FileStructSize[k-1]>1) and fat_directory_directory=fat_directory_directory)) then
+            begin
+             CurCluster:=Pfat_directory_structure(@copycontent)^.directoryfirstclusterhighword shl 16
+             +Pfat_directory_structure(@copycontent)^.directoryfirstclusterlowword;
+            end;
+           break;
+          end
+         else if(genfs_check_prefix(searchpath,totalpath.FilePath[k-1],true)) then
+          begin
+           if(j>1) then HavePrevNext:=true;
+           if(fs.fsname<=filesystem_fat16) then
+           fatpos:=genfs_fat_location_of_file_info(fs,totalpath.FileMainPos[k-1],
+           totalpath.FileSubPos[k-1],1)
+           else if(fs.fsname=filesystem_fat32) then
+           fatpos:=genfs_fat_location_of_file_info(fs,totalpath.FileMainPos[k-1],
+           totalpath.FileSubPos[k-1],totalpath.FileStructSize[k-1]);
+          end;
+         inc(k);
+        end;
+       if(k<=totalpath.count) then
+        begin
+         PrevCluster:=CurCluster;
+         if(searchpath='/') or (searchpath='\') then searchpath:=searchpath+pathstr.path[j-1]
+         else searchpath:=searchpath+'/'+pathstr.path[j-1];
+         inc(j);
+         continue;
+        end
+       else
+        begin
+         FATAlist:=genfs_fat_get_available_cluster(fs,1);
+         if(FATAlist.count=0) then
+          begin
+           writeln('ERROR:File System cannot allocate more cluster to new information.');
+           readln;
+           abort;
+          end;
+         CurCluster:=FATAlist.index[0];
+         fatpos.MainPos:=CurCluster; fatpos.SubPos:=0;
+        end;
+       if(j>1) and (HavePrevNext=false) then
+        begin
+         fatstr:=fat_PWideCharToFatString('.');
+         fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory,
+         genfs_date_to_fat_date,genfs_time_to_fat_time,0,CurCluster);
+         PosInFile:=genfs_fat_cluster_to_file_position(fs,CurCluster);
+         genfs_io_write(fs,fatdir,PosInFile,sizeof(fat_directory_structure));
+         fatstr:=fat_PWideCharToFatString('..');
+         fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_directory,
+         genfs_date_to_fat_date,genfs_time_to_fat_time,0,PrevCluster);
+         PosInFile:=genfs_fat_cluster_to_file_position(fs,CurCluster)+sizeof(fat_directory_structure);
+         genfs_io_write(fs,fatdir,PosInFile,sizeof(fat_directory_structure));
+         if(fs.fsname<=filesystem_fat12) then fatentry.entry12:=fat12_final_cluster_low
+         else if(fs.fsname<=filesystem_fat16) then fatentry.entry16:=fat16_final_cluster_low
+         else if(fs.fsname<=filesystem_fat32) then fatentry.entry32:=fat32_final_cluster_low;
+         if(fs.fsname=filesystem_fat32) then
+          begin
+           dec(fs.fat32.fsinfo.freecount,1);
+           FATAlist:=genfs_fat_get_available_cluster(fs,1);
+           if(FATAlist.count=0) then
+            begin
+             writeln('ERROR:File System cannot allocate more cluster to new information.');
+             readln;
+             abort;
+            end;
+           fs.fat32.fsinfo.nextfree:=FATAlist.index[0];
+          end;
+         genfs_fat_write_entry(fs,fatentry,CurCluster);
+         inc(fatpos.subpos,2);
+         PrevCluster:=CurCluster;
+        end;
+       tempstr:=UnicodeStringToPWideChar(pathstr.path[j-1]);
+       fatstr:=fat_PWideCharToFatString(tempstr);
+       if(srcpath.FileClass[i-1] and fat_directory_file=fat_directory_file) and (j=pathstr.count) then
+       tempsize:=genfs_fat_get_file_size(fs,srcpath.FilePath[i-1])
+       else tempsize:=0;
+       if(fs.fsname<=filesystem_fat16) then
+       fatposlist:=genfs_fat_location_of_next_directory_list(fs,fatpos.MainPos,fatpos.SubPos,1)
+       else
+       fatposlist:=genfs_fat_location_of_next_directory_list(fs,fatpos.MainPos,fatpos.SubPos,
+       fat_calculate_directory_size(tempstr) div sizeof(fat_directory_structure));
+       if(fatstr.unicodefn<>nil) then
+        begin
+         FreeMem(fatstr.unicodefn); fatstr.unicodefn:=nil; fatstr.unicodefncount:=0;
+        end;
+       {Generate new cluster for File System}
+       FATAlist.count:=0;
+       if(fatposlist.count=1) and (fatpos.MainPos<>fatposlist.item[0].MainPos) and (j>1) then
+       FATAlist:=genfs_fat_get_available_cluster(fs,2)
+       else if(fatposlist.count=1) and (fatpos.MainPos<>fatposlist.item[0].MainPos) and (j=1) then
+       FATAlist:=genfs_fat_get_available_cluster(fs,3)
+       else if(fatposlist.count=1) and (j>1) then
+       FATAlist:=genfs_fat_get_available_cluster(fs,1)
+       else if(fatposlist.count=1) then
+       FATAlist:=genfs_fat_get_available_cluster(fs,2)
+       else
+       FATAlist:=genfs_fat_get_available_cluster(fs,fatposlist.count+1);
+       if(FATAlist.count>0) then
+        begin
+         CurCluster:=FATAlist.index[fatposlist.count];
+         dec(fs.fat32.fsinfo.freecount,fatposlist.count);
+         fs.fat32.fsinfo.nextfree:=FATAlist.index[FATAlist.count-1];
+        end
+       else
+        begin
+         writeln('ERROR:File System cannot allocate more cluster to new information.');
+         readln;
+         abort;
+        end;
+       if(fs.fsname<=filesystem_fat16) or (fatstr.unicodefncount=0) then
+        begin
+         if(srcpath.FileClass[i-1] and fat_directory_file=fat_directory_file) and (j=pathstr.count)
+         and (genfs_fat_get_file_size(fs,srcpath.FilePath[i-1])=0) then
+         fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_file,
+         genfs_date_to_fat_date,genfs_time_to_fat_time,tempsize,0)
+         else if(srcpath.FileClass[i-1] and fat_directory_file=fat_directory_file) and (j=pathstr.count) then
+         fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_file,
+         genfs_date_to_fat_date,genfs_time_to_fat_time,tempsize,CurCluster)
+         else
+         fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_file,
+         genfs_date_to_fat_date,genfs_time_to_fat_time,0,CurCluster);
+        end
+       else
+        begin
+         if(srcpath.FileClass[i-1] and fat_directory_file=fat_directory_file) and (j=pathstr.count)
+         and (genfs_fat_get_file_size(fs,srcpath.FilePath[i-1])=0) then
+         fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_file or fat_directory_long,
+         genfs_date_to_fat_date,genfs_time_to_fat_time,tempsize,CurCluster)
+         else if(srcpath.FileClass[i-1] and fat_directory_file=fat_directory_file) and (j=pathstr.count) then
+         fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_file or fat_directory_long,
+         genfs_date_to_fat_date,genfs_time_to_fat_time,tempsize,CurCluster)
+         else
+         fatdir:=fat_FatStringToFatDirectory(fatstr,fat_directory_file or fat_directory_long,
+         genfs_date_to_fat_date,genfs_time_to_fat_time,0,CurCluster);
+        end;
+       {Add File Information to the System}
+       if(j>1) and (HavePrevNext=false) then
+        begin
+         inc(totalpath.Count);
+         SetLength(totalpath.FileClass,totalpath.count);
+         totalpath.FileClass[totalpath.count-1]:=fat_directory_directory;
+         SetLength(totalpath.FilePath,totalpath.count);
+         if(searchpath='/') or (searchpath='\') then
+         totalpath.FilePath[totalpath.count-1]:=SearchPath+'.'
+         else
+         totalpath.FilePath[totalpath.count-1]:=SearchPath+'/.';
+         SetLength(totalpath.FileMainPos,totalpath.count);
+         totalpath.FileMainPos[totalpath.count-1]:=fatpos.MainPos;
+         SetLength(totalpath.FileSubPos,totalpath.count);
+         totalpath.FileSubPos[totalpath.count-1]:=0;
+         SetLength(totalpath.FileShortStr,totalpath.count);
+         totalpath.FileShortStr[totalpath.count-1]:='.';
+         if(fs.fsname=filesystem_fat32) then
+          begin
+           SetLength(totalpath.FileStructSize,totalpath.count);
+           totalpath.FileStructSize[totalpath.count-1]:=1;
+          end;
+         inc(totalpath.Count);
+         SetLength(totalpath.FileClass,totalpath.count);
+         totalpath.FileClass[totalpath.count-1]:=fat_directory_directory;
+         SetLength(totalpath.FilePath,totalpath.count);
+         if(searchpath='/') or (searchpath='\') then
+         totalpath.FilePath[totalpath.count-1]:=SearchPath+'..'
+         else
+         totalpath.FilePath[totalpath.count-1]:=SearchPath+'/..';
+         SetLength(totalpath.FileMainPos,totalpath.count);
+         totalpath.FileMainPos[totalpath.count-1]:=fatpos.MainPos;
+         SetLength(totalpath.FileSubPos,totalpath.count);
+         totalpath.FileSubPos[totalpath.count-1]:=1;
+         SetLength(totalpath.FileShortStr,totalpath.count);
+         totalpath.FileShortStr[totalpath.count-1]:='..';
+         if(fs.fsname=filesystem_fat32) then
+          begin
+           SetLength(totalpath.FileStructSize,totalpath.count);
+           totalpath.FileStructSize[totalpath.count-1]:=1;
+          end;
+        end;
+       inc(totalpath.count);
+       SetLength(totalpath.FilePath,totalpath.count);
+       SetLength(totalpath.FileClass,totalpath.count);
+       SetLength(totalpath.FileMainPos,totalpath.count);
+       SetLength(totalpath.FileSubPos,totalpath.count);
+       SetLength(totalpath.FileShortStr,totalpath.count);
+       if(fs.fsname=filesystem_fat32) then SetLength(totalpath.FileStructSize,totalpath.count);
+       if(fs.fsname=filesystem_fat32) and (fatdir.longdircount>0) then
+        begin
+         if(j=pathstr.Count) and (srcpath.FileClass[i-1] and fat_directory_file=fat_directory_file) then
+         totalpath.FileClass[totalpath.count-1]:=fat_directory_file or fat_directory_long
+         else
+         totalpath.FileClass[totalpath.count-1]:=fat_directory_directory or fat_directory_long;
+         if(searchpath='/') or (searchpath='\') then
+         totalpath.FilePath[totalpath.count-1]:=searchpath+pathstr.path[j-1]
+         else
+         totalpath.FilePath[totalpath.count-1]:=searchpath+'/'+pathstr.path[j-1];
+         totalpath.FileMainPos[totalpath.count-1]:=fatpos.MainPos;
+         totalpath.FileSubPos[totalpath.count-1]:=fatpos.SubPos;
+         totalpath.FileShortStr[totalpath.count-1]:=genfs_fat_extract_short_name(fatdir.dir);
+         totalpath.FileStructSize[totalpath.count-1]:=fatdir.longdircount+1;
+        end
+       else
+        begin
+         if(j=pathstr.count) and (srcpath.FileClass[i-1] and fat_directory_file=fat_directory_file) then
+         totalpath.FileClass[totalpath.count-1]:=fat_directory_file
+         else
+         totalpath.FileClass[totalpath.count-1]:=fat_directory_directory;
+         if(searchpath='/') or (searchpath='\') then
+         totalpath.FilePath[totalpath.count-1]:=searchpath+pathstr.path[j-1]
+         else
+         totalpath.FilePath[totalpath.count-1]:=searchpath+'/'+pathstr.path[j-1];
+         totalpath.FileMainPos[totalpath.count-1]:=fatpos.MainPos;
+         totalpath.FileSubPos[totalpath.count-1]:=fatpos.SubPos;
+         totalpath.FileShortStr[totalpath.count-1]:=genfs_fat_extract_short_name(fatdir.dir);
+         if(fs.fsname=filesystem_fat32) then totalpath.FileStructSize[totalpath.count-1]:=1;
+        end;
+       {Generate the missing directory}
+       n:=1;
+       for k:=1 to fatposlist.count do
+        begin
+         if(k<fatposlist.count) then
+          begin
+           if(fs.fsname=filesystem_fat12) then
+           fatentry.entry12:=fatposlist.item[k].MainPos
+           else if(fs.fsname=filesystem_fat16) then
+           fatentry.entry16:=fatposlist.item[k].MainPos
+           else if(fs.fsname=filesystem_fat32) then
+           fatentry.entry32:=fatposlist.item[k].MainPos;
+           genfs_fat_write_entry(fs,fatentry,fatposlist.item[k-1].MainPos);
+          end
+         else
+          begin
+           if(fs.fsname=filesystem_fat12) then
+           fatentry.entry12:=fat12_final_cluster_low
+           else if(fs.fsname=filesystem_fat16) then
+           fatentry.entry16:=fat16_final_cluster_low
+           else if(fs.fsname=filesystem_fat32) then
+           fatentry.entry32:=fat32_final_cluster_low;
+           genfs_fat_write_entry(fs,fatentry,fatposlist.item[k-1].MainPos);
+          end;
+         for m:=1 to fatposlist.size[k-1] do
+          begin
+           PosInFile:=genfs_fat_cluster_to_file_position(fs,fatposlist.item[k-1].MainPos)+
+           (fatposlist.item[k-1].SubPos+m-1)*sizeof(fat_directory_structure);
+           if(fs.fsname=filesystem_fat32) and (fatdir.longdircount>0) then
+           genfs_io_write(fs,(fatdir.longdir+n-1)^,PosInFile,sizeof(fat_long_directory_structure))
+           else
+           genfs_io_write(fs,fatdir.dir,PosInFile,sizeof(fat_directory_structure));
+           inc(n);
+          end;
+        end;
+       {Check the source item is directory or file}
+       if(j=pathstr.count) and (srcpath.FileClass[i-1] and fat_directory_file=fat_directory_file) then
+        begin
+         {Get the file Storage Position}
+         BytePerSector:=fs.fat12.header.head.bpb_bytesPerSector;
+         SectorPerCluster:=fs.fat12.header.head.bpb_SectorPerCluster;
+         tempcluster:=genfs_fat_get_file_cluster(fs,srcpath.FilePath[i-1]);
+         tempsize:=genfs_fat_get_file_size(fs,srcpath.FilePath[i-1]);
+         FATUlist:=genfs_fat_get_using_cluster(fs,tempcluster);
+         tempsize:=genfs_fat_get_file_size(fs,srcpath.FilePath[i-1]);
+         FATAlist:=genfs_fat_get_available_cluster(fs,
+         (tempsize+BytePerSector*SectorPerCluster-1) div (BytePerSector*SectorPerCluster)+1);
+         {Copy the file into destination}
+         if(FATAlist.count=(tempsize+BytePerSector*SectorPerCluster-1)
+         div (BytePerSector*SectorPerCluster)) then
+         n:=FATAlist.count+1
+         else if(FATAlist.count=(tempsize+BytePerSector*SectorPerCluster-1)
+         div (BytePerSector*SectorPerCluster)+1) then
+         n:=FATAlist.count
+         else
+          begin
+           writeln('ERROR:Out of disk free space.');
+           readln;
+           abort;
+          end;
+         Ptr1:=0; Ptr2:=0;
+         for k:=1 to n-1 do
+          begin
+           Ptr1:=genfs_fat_cluster_to_file_position(fs,FATUlist.index[k-1]);
+           Ptr2:=genfs_fat_cluster_to_file_position(fs,FATAlist.index[k-1]);
+           if(k<n-1) then
+            begin
+             if(fs.fsname=filesystem_fat12) then
+             FATentry.entry12:=FATAlist.index[k]
+             else if(fs.fsname=filesystem_fat16) then
+             FATentry.entry16:=FATAlist.index[k]
+             else if(fs.fsname=filesystem_fat32) then
+             FATentry.entry32:=FATAlist.index[k];
+             genfs_fat_write_entry(fs,FATentry,FATAlist.index[k-1]);
+            end
+           else
+            begin
+             if(fs.fsname=filesystem_fat12) then
+             FATentry.entry12:=fat12_final_cluster_low
+             else if(fs.fsname=filesystem_fat16) then
+             FATentry.entry16:=fat16_final_cluster_low
+             else if(fs.fsname=filesystem_fat32) then
+             FATentry.entry32:=fat32_final_cluster_low;
+             genfs_fat_write_entry(fs,FATentry,FATAlist.index[k-1]);
+            end;
+           for m:=1 to (BytePerSector*SectorPerCluster) shr 9 do
+            begin
+             if(tempsize>=1 shl 9)then
+              begin
+               genfs_io_read(fs,copycontent,Ptr1+(m-1) shl 9,1 shl 9);
+               genfs_io_write(fs,copycontent,Ptr2+(m-1) shl 9,1 shl 9);
+              end
+             else if(tempsize>0) then
+              begin
+               genfs_io_read(fs,copycontent,Ptr1+(m-1) shl 9,tempsize);
+               genfs_io_write(fs,copycontent,Ptr2+(m-1) shl 9,tempsize);
+               tempsize:=0;
+               break;
+              end;
+             dec(tempsize,1 shl 9);
+            end;
+          end;
+        end;
+      end;
+     if(searchpath='/') or (searchpath='\') then searchpath:=searchpath+pathstr.path[j-1]
+     else searchpath:=searchpath+'/'+pathstr.path[j-1];
+     inc(j);
     end;
   end;
- genfs_write(fs);
+ genfs_filesystem_write_info(fs);
 end;
-{File System Extract Item}
-procedure genfs_filesystem_extract(fs:genfs_filesystem;srcpath:UnicodeString;destpath:UnicodeString);
-var i,index,size,tempnum1,tempnum2,tempindex,tempstorage,tempcount,tempoffset:SizeUInt;
-    temppath,basepath:UnicodeString;
-    templist:genfs_index_list;
-    inlist:genfs_inner_path;
-    sdir:fat_directory_structure;
-    extcontent:array[1..512] of byte;
-    exist:boolean;
-    ismask:boolean;
-    iobyte:byte=0;
+{File System File Compare Operation inside}
+function genfs_filesystem_compare(fs:genfs_filesystem;basedir,comparedir:UnicodeString):boolean;
+var totalpath,basepath,comparepath:genfs_inner_path;
+    baserootpath,comparerootpath:UnicodeString;
+    temppath1,temppath2:UnicodeString;
+    baseismask,compareismask:boolean;
+    i,j,k,m,len1,len2:SizeUint;
+    comparecontent1,comparecontent2:array[1..512] of byte;
+    tempsize1,tempsize2:SizeUint;
+    FileInPos1,FileInPos2:SizeUint;
+    BytePerSector,SectorPerCluster:SizeUint;
+{For FAT Only}
+    PtrCluster1,PtrCluster2:SizeUint;
+    FATUlist1,FATUlist2:genfs_fat_cluster_list;
 begin
- for i:=1 to 512 do extcontent[i]:=0;
- i:=1; exist:=false;
- ismask:=genfs_is_mask(srcpath);
- inlist:=genfs_search_for_path(fs,'/');
- if(fs.fsname=filesystem_fat12) then
+ totalpath:=genfs_filesystem_search_for_path(fs);
+ basepath.count:=0;
+ baseismask:=genfs_is_mask(basedir);
+ if(baseismask) then
+ baserootpath:=genfs_extract_search_path_without_wildcard(basedir)
+ else
+ baserootpath:=genfs_extract_file_path(basedir);
+ len1:=length(baserootpath);
+ comparepath.count:=0;
+ compareismask:=genfs_is_mask(comparedir);
+ if(compareismask) then
+ comparerootpath:=genfs_extract_search_path_without_wildcard(comparedir)
+ else
+ comparerootpath:=genfs_extract_file_path(comparedir);
+ len2:=length(comparerootpath);
+ i:=1;
+ while(i<=totalpath.count)do
   begin
-   tempnum1:=fs.fat12.header.head.bpb_bytesPerSector;
-   tempnum2:=fs.fat12.header.head.bpb_SectorPerCluster;
-   for i:=1 to inlist.Count do
+   if((baseismask) and (genfs_mask_match(basedir,totalpath.FilePath[i-1])))
+   or(genfs_check_prefix(basedir,totalpath.FilePath[i-1]))then
     begin
-     if(ismask=true) and (inlist.FileClass[i-1]<>fat_directory_volume) and
-     (genfs_mask_match(srcpath,inlist.FilePath[i-1])) then
+     inc(basepath.count);
+     SetLength(basepath.FilePath,basepath.count);
+     basepath.FilePath[basepath.count-1]:=totalpath.FilePath[i-1];
+     SetLength(basepath.FileSubPos,basepath.Count);
+     basepath.FileSubPos[basepath.count-1]:=totalpath.FileSubPos[i-1];
+     SetLength(basepath.FileMainPos,basepath.count);
+     basepath.FileMainPos[basepath.count-1]:=totalpath.FileMainPos[i-1];
+     SetLength(basepath.FileClass,basepath.count);
+     basepath.FileClass[basepath.count-1]:=totalpath.FileClass[i-1];
+     if(fs.fsname<=filesystem_fat32) then
       begin
-       exist:=true;
-       basepath:=genfs_Extract_filepath(srcpath);
-       temppath:=Copy(srcpath,length(basepath)+2,length(srcpath)-length(basepath)-1);
-       if(inlist.FileClass[i-1]=fat_directory_directory) then
-       CreateDir(destpath+'/'+temppath)
+       SetLength(basepath.FileShortStr,basepath.count);
+       basepath.FileShortStr[basepath.count-1]:=totalpath.FileShortStr[i-1];
+      end;
+     if(fs.fsname=filesystem_fat32) then
+      begin
+       SetLength(basepath.FileStructSize,basepath.count);
+       basepath.FileStructSize[basepath.count-1]:=totalpath.FileStructSize[i-1];
+      end;
+    end;
+   if((compareismask) and (genfs_mask_match(comparedir,totalpath.FilePath[i-1])))
+   or(genfs_check_prefix(basedir,totalpath.FilePath[i-1]))then
+    begin
+     inc(comparepath.count);
+     SetLength(comparepath.FilePath,comparepath.count);
+     comparepath.FilePath[comparepath.count-1]:=totalpath.FilePath[i-1];
+     SetLength(comparepath.FileSubPos,comparepath.Count);
+     comparepath.FileSubPos[comparepath.count-1]:=totalpath.FileSubPos[i-1];
+     SetLength(comparepath.FileMainPos,comparepath.count);
+     comparepath.FileMainPos[comparepath.count-1]:=totalpath.FileMainPos[i-1];
+     SetLength(comparepath.FileClass,comparepath.count);
+     comparepath.FileClass[comparepath.count-1]:=totalpath.FileClass[i-1];
+     if(fs.fsname<=filesystem_fat32) then
+      begin
+       SetLength(comparepath.FileShortStr,comparepath.count);
+       comparepath.FileShortStr[comparepath.count-1]:=totalpath.FileShortStr[i-1];
+      end;
+     if(fs.fsname=filesystem_fat32) then
+      begin
+       SetLength(comparepath.FileStructSize,comparepath.count);
+       comparepath.FileStructSize[comparepath.count-1]:=totalpath.FileStructSize[i-1];
+      end;
+    end;
+   inc(i);
+  end;
+ {Check whether the directory path is same}
+ if(basedir=comparedir) then
+  begin
+   exit(false);
+  end
+ else if(basepath.Count<>comparepath.Count) then
+  begin
+   exit(false);
+  end;
+ {Compare the directory's filename}
+ i:=1;
+ while(i<=basepath.count)do
+  begin
+   if(baserootpath='') then
+   temppath1:=basepath.FilePath[i-1]
+   else
+   temppath1:=Copy(basepath.FilePath[i-1],len1+2,length(basepath.FilePath[i-1])-len1-1);
+   if(comparerootpath='') then
+   temppath2:=comparepath.FilePath[i-1]
+   else
+   temppath2:=Copy(comparepath.FilePath[i-1],len2+2,length(comparepath.FilePath[i-1])-len2-1);
+   if(temppath1<>temppath2) then break
+   else if(basepath.FileClass[i-1] and fat_directory_file=fat_directory_file)
+   and(comparepath.FileClass[i-1] and fat_directory_file=fat_directory_file) then
+    begin
+     {If the same path pointed the file name in same relative path,compare the content}
+     if(fs.fsname<=filesystem_fat32) then
+      begin
+       BytePerSector:=fs.fat12.header.head.bpb_bytesPerSector;
+       SectorPerCluster:=fs.fat12.header.head.bpb_SectorPerCluster;
+       PtrCluster1:=genfs_fat_get_file_cluster(fs,basepath.FilePath[i-1]);
+       PtrCluster2:=genfs_fat_get_file_cluster(fs,comparepath.FilePath[i-1]);
+       tempsize1:=genfs_fat_get_file_size(fs,basepath.FilePath[i-1]);
+       tempsize2:=genfs_fat_get_file_size(fs,comparepath.FilePath[i-1]);
+       FATUlist1:=genfs_fat_get_using_cluster(fs,PtrCluster1);
+       FATUlist2:=genfs_fat_get_using_cluster(fs,PtrCluster2);
+       if(FATUList1.count<>FATUlist2.count) or (tempsize1<>tempsize2) then
+        begin
+         break;
+        end
        else
         begin
-         genfs_io_read(fs,sdir,fs.fat12.datastart+inlist.FileOffset[i-1],sizeof(fat_directory_structure));
-         index:=sdir.directoryfirstclusterhighword shl 16+sdir.directoryfirstclusterlowword;
-         size:=sdir.directoryfilesize;
-         templist:=genfs_filesystem_get_using_cluster(fs,index);
-         if(size=0) then
+         j:=1;
+         while(j<=FATUlist1.count)do
           begin
-           genfs_external_io_write(destpath+'/'+temppath,iobyte,0,0);
-          end
-         else
-          begin
-           tempindex:=templist.index[0]; tempstorage:=0;
-           tempoffset:=0; tempcount:=size shr 9+1;
-           while(tempcount>0)do
+           PtrCluster1:=FATUlist1.index[j-1]; PtrCluster2:=FATUlist2.index[j-1];
+           k:=1;
+           FileInPos1:=genfs_fat_cluster_to_file_position(fs,PtrCluster1);
+           FileInPos2:=genfs_fat_cluster_to_file_position(fs,PtrCluster2);
+           while(k<=(BytePerSector*SectorPerCluster) shr 9)do
             begin
-             if(tempstorage+512<=Size) then
+             if(tempsize1>=1 shl 9) then
               begin
-               genfs_io_read(fs,extcontent,fs.fat12.datastart+
-               (tempindex-2)*tempnum1*tempnum2+tempoffset,512);
-               genfs_external_io_write(destpath+'/'+temppath,extcontent,tempstorage,512);
-               inc(tempstorage,512);
+               genfs_io_read(fs,comparecontent1,FileInPos1+(k-1) shl 9,1 shl 9);
+               genfs_io_read(fs,comparecontent2,FileInPos2+(k-1) shl 9,1 shl 9);
+               m:=1;
+               while(m<=1 shl 9) do
+                begin
+                 if(comparecontent1[m]<>comparecontent2[m]) then break;
+                 inc(m);
+                end;
+               if(m<=1 shl 9) then break;
               end
              else
               begin
-               genfs_io_read(fs,extcontent,fs.fat12.datastart+
-               (tempindex-2)*tempnum1*tempnum2+tempoffset,size-tempstorage);
-               genfs_external_io_write(destpath+'/'+temppath,extcontent,tempstorage,size-tempstorage);
-               tempstorage:=size;
+               genfs_io_read(fs,comparecontent1,FileInPos1+(k-1) shl 9,tempsize1);
+               genfs_io_read(fs,comparecontent2,FileInPos2+(k-1) shl 9,tempsize1);
+               m:=1;
+               while(m<=tempsize1) do
+                begin
+                 if(comparecontent1[m]<>comparecontent2[m]) then break;
+                 inc(m);
+                end;
+               if(m<=tempsize1) then break;
               end;
-             inc(tempoffset,1 shl 9);
-             if(tempoffset=tempnum1*tempnum2) then
-              begin
-               tempindex:=templist.index[size shr 9+1-tempcount];
-               tempoffset:=0;
-              end;
-             dec(tempcount);
+             inc(k);
             end;
+           if(k<=(BytePerSector*SectorPerCluster) shr 9) then break;
+           dec(tempsize1,1 shl 9); dec(tempsize2,1 shl 9);
+           inc(j);
           end;
+         if(j<=FATUlist1.count) then break;
         end;
       end
-     else if(ismask=false) and (inlist.FileClass[i-1]<>fat_directory_volume)
-     and (genfs_check_prefix(srcpath,inlist.FilePath[i-1])) then
+     else
       begin
-       exist:=true;
-       basepath:=genfs_extract_filepath(inlist.FilePath[i-1]);
-       temppath:=Copy(inlist.FilePath[i-1],length(basepath)+2,length(inlist.FilePath[i-1])
-       -length(basepath)-1);
-       if(inlist.FileClass[i-1]=fat_directory_directory) then
-       CreateDir(destpath+'/'+temppath)
+
+      end;
+    end;
+   inc(i);
+  end;
+ if(i>basepath.count) then Result:=true else Result:=false;
+end;
+{File System File Compare Operation outside}
+function genfs_filesystem_compare_external(fs:genfs_filesystem;basedir,extdir:UnicodeString):boolean;
+var innerpath:genfs_inner_path;
+    extpath:genfs_path;
+    innerrootpath,extrootpath,temppath1,temppath2:UnicodeString;
+    compcontent1,compcontent2:array[1..128] of dword;
+    len1,len2,i,j,k,m,n,templen1,templen2:SizeUint;
+    tempsize1,tempsize2:SizeUint;
+    PosInFile:SizeUint;
+    PosInExtFile:SizeUint;
+    BytePerSector,SectorPerCluster:SizeUint;
+{For FAT Only}
+    CurCluster:SizeUint;
+    FATUlist:genfs_fat_cluster_list;
+begin
+ innerpath:=genfs_filesystem_search_for_path(fs,basedir);
+ extpath:=genfs_external_search_for_path(extdir);
+ if(innerpath.Count-innerpath.FilePrevNextCount<>extpath.count) then
+  begin
+   exit(false);
+  end
+ else
+  begin
+   if(genfs_is_mask(basedir)) then
+   innerrootpath:=genfs_extract_search_path_without_wildcard(basedir)
+   else
+   innerrootpath:=genfs_extract_file_path(basedir);
+   len1:=length(innerrootpath);
+   if(genfs_is_mask(extdir)) then
+   extrootpath:=genfs_extract_search_path_without_wildcard(extdir)
+   else
+   extrootpath:=genfs_extract_file_path(extdir);
+   len2:=length(extrootpath);
+   i:=1; j:=1;
+   while(i<=innerpath.count)do
+    begin
+     templen1:=length(innerpath.FilePath[i-1]);
+     if(Copy(innerpath.FilePath[i-1],templen1-1,3)='/..')
+     or(Copy(innerpath.FilePath[i-1],templen1-1)='/.')
+     or(Copy(innerpath.FilePath[i-1],templen1-1,3)='\..')
+     or(Copy(innerpath.FilePath[i-1],templen1-1)='\.') then
+      begin
+       inc(i); continue;
+      end;
+     templen2:=length(extpath.FilePath[j-1]);
+     if(innerrootpath='') then temppath1:=innerpath.FilePath[i-1]
+     else temppath1:=Copy(innerpath.FilePath[i-1],len1+2,templen1-len1-1);
+     if(extrootpath='') then temppath2:=extpath.FilePath[j-1]
+     else temppath2:=Copy(extpath.FilePath[j-1],len2+2,templen2-len2+1);
+     if(temppath1<>temppath2) then break
+     else if(fs.fsname<=filesystem_fat32)
+     and(innerpath.FileClass[i-1] and fat_directory_file=fat_directory_file)
+     and(extpath.IsFile[j-1]) then
+      begin
+       BytePerSector:=fs.fat12.header.head.bpb_bytesPerSector;
+       SectorPerCluster:=fs.fat12.header.head.bpb_SectorPerCluster;
+       tempsize1:=genfs_fat_get_file_size(fs,innerpath.FilePath[i-1]);
+       tempsize2:=genfs_external_file_size(extpath.FilePath[j-1]);
+       if(tempsize1<>tempsize2) then break;
+       {Compare the File Content}
+       CurCluster:=genfs_fat_get_file_cluster(fs,innerpath.FilePath[i-1]);
+       FATUlist:=genfs_fat_get_using_cluster(fs,CurCluster);
+       PosInExtFile:=0; PosInFile:=genfs_fat_cluster_to_file_position(fs,CurCluster);
+       k:=1;
+       while(k<=FATUlist.Count)do
+        begin
+         PosInFile:=genfs_fat_cluster_to_file_position(fs,FATUlist.index[k-1]);
+         m:=1;
+         while(m<=(BytePerSector*SectorPerCluster) shr 9) do
+          begin
+           if(tempsize1>=1 shl 9) then
+            begin
+             genfs_external_io_read(extpath.FilePath[j-1],compcontent1,PosInExtFile+(m-1) shl 9,1 shl 9);
+             genfs_io_read(fs,compcontent2,PosInFile+(m-1) shl 9,1 shl 9);
+             n:=1;
+             while(n<=1 shl 9)do
+              begin
+               if(compcontent1[n]<>compcontent2[n]) then break;
+               inc(n);
+              end;
+             if(n<=1 shl 9) then break;
+            end
+           else if(tempsize1<1 shl 9) then
+            begin
+             genfs_external_io_read(extpath.FilePath[j-1],compcontent1,PosInExtFile+(m-1) shl 9,tempsize1);
+             genfs_io_read(fs,compcontent2,PosInFile+(m-1) shl 9,tempsize1);
+             n:=1;
+             while(n<=tempsize1)do
+              begin
+               if(compcontent1[n]<>compcontent2[n]) then break;
+               inc(n);
+              end;
+             if(n<=tempsize1) then break;
+            end;
+           inc(PosInExtFile,1 shl 9);
+           inc(m);
+          end;
+         if(m<=(BytePerSector*SectorPerCluster) shr 9) then break;
+         inc(k); dec(tempsize1,1 shl 9); dec(tempsize2,1 shl 9);
+        end;
+       if(k<=FATUlist.count) then break;
+      end;
+     inc(i); inc(j);
+    end;
+   if(i<=innerpath.count) then Result:=true else Result:=false;
+  end;
+end;
+{FAT File System Erase Cluster}
+procedure genfs_fat_erase_cluster(var fs:genfs_filesystem;clusterindex:SizeUint);
+var content:array[1..512] of byte;
+    i:SizeUint;
+    BytePerSector,SectorPerCluster:SizeUint;
+    PosInFile:SizeUint;
+begin
+ BytePerSector:=fs.fat12.header.head.bpb_bytesPerSector;
+ SectorPerCluster:=fs.fat12.header.head.bpb_SectorPerCluster;
+ for i:=1 to 512 do content[i]:=0;
+ PosInFile:=genfs_fat_cluster_to_file_position(fs,clusterindex);
+ i:=1;
+ while(i<=(BytePerSector*SectorPerCluster) shr 9)do
+  begin
+   genfs_io_write(fs,content,PosInFile+(i-1) shl 9,1 shl 9);
+  end;
+ if(fs.fsname=filesystem_fat32) and (Clusterindex<=fs.fat32.fsinfo.nextfree) then
+ fs.fat32.fsinfo.nextfree:=clusterindex;
+ if(fs.fsname=filesystem_fat32) then inc(fs.fat32.fsinfo.freecount);
+end;
+{FAT File System Move List,Only Move to left}
+procedure genfs_fat_move_directory(var fs:genfs_filesystem;rootdir:UnicodeString;
+MoveStart:genfs_fat_position_info;MoveEnd:genfs_fat_position_info;
+MoveStep:SizeUint);
+var FATUlist:genfs_fat_cluster_list;
+    StartCluster,i:SizeUint;
+    StartPos,StartOffset,Startindex:SizeUint;
+    EndPos,EndOffset,endindex:SizeUint;
+    MoveIndex,MoveOffset,MoveInterval:SizeUint;
+    BytePerSector,SectorPerCluster:SizeUint;
+    testbyte:byte=0;
+    PosInFile:SizeUint;
+    PosInFile1:SizeUint;
+    PosInFile2:SizeUint;
+    FATentry:fat_entry;
+begin
+ BytePerSector:=fs.fat12.header.head.bpb_bytesPerSector;
+ SectorPerCluster:=fs.fat12.header.head.bpb_SectorPerCluster;
+ {Initialization of function}
+ StartCluster:=genfs_fat_get_file_cluster(fs,rootdir);
+ FATUlist:=genfs_fat_get_using_cluster(fs,StartCluster);
+ StartPos:=MoveStart.MainPos; StartOffset:=MoveStart.SubPos;
+ EndPos:=MoveEnd.MainPos; EndOffset:=MoveEnd.SubPos;
+ {Get the Startindex and Endindex in FATUList}
+ i:=1;
+ while(i<=FATUList.count)do
+  begin
+   if(StartPos=FATUlist.index[i-1]) then break;
+   inc(i);
+  end;
+ StartIndex:=i;
+ i:=1;
+ while(i<=FATUList.count)do
+  begin
+   if(EndPos=FATUlist.index[i-1]) then break;
+   inc(i);
+  end;
+ EndIndex:=i;
+ {Then ignore StartPos and EndPos,And Get the first move destination}
+ MoveIndex:=startindex; MoveOffset:=startoffset; MoveInterval:=MoveStep;
+ while(MoveInterval>0)do
+  begin
+   if(Moveoffset>0) then dec(MoveOffset)
+   else
+    begin
+     MoveOffset:=(BytePerSector*SectorPerCluster) shr 5;
+     dec(MoveIndex);
+    end;
+   dec(MoveInterval);
+  end;
+ {The Move the directory}
+ while(MoveInterval<=MoveStep)do
+  begin
+   PosInFile1:=genfs_fat_cluster_to_file_position(fs,FATUlist.index[MoveIndex-1])
+   +(MoveOffset-1)*sizeof(fat_directory_structure);
+   PosInFile2:=genfs_fat_cluster_to_file_position(fs,FATUlist.index[MoveIndex-1])
+   +(StartOffset-1)*sizeof(fat_directory_structure);
+   genfs_io_move(fs,PosInFile1,PosInFile2,sizeof(fat_directory_structure));
+   if(Moveoffset<(BytePerSector*SectorPerCluster) shr 5) then inc(MoveOffset)
+   else
+    begin
+     MoveOffset:=0; inc(MoveIndex);
+    end;
+   if(StartOffset<(BytePerSector*SectorPerCluster) shr 5) then inc(StartOffset)
+   else
+    begin
+     StartOffset:=0; inc(StartIndex);
+    end;
+   if(Startindex=EndIndex) and (StartOffset>=EndOffset-1) then break;
+   inc(MoveInterval);
+  end;
+ {Detect the directory is vaild or not}
+ i:=FATUlist.count;
+ while(i>0)do
+  begin
+   PosInFile:=genfs_fat_cluster_to_file_position(fs,FATUList.index[i-1]);
+   genfs_io_read(fs,testbyte,PosInFile,1);
+   if(testbyte=0) and (i>1) then
+    begin
+     if(fs.fsname=filesystem_fat32) then
+      begin
+       inc(fs.fat32.fsinfo.freecount,1);
+       fs.fat32.fsinfo.nextfree:=FATUlist.index[i-1];
+      end;
+     fatentry.entry32:=0;
+     genfs_fat_write_entry(fs,fatentry,FATUList.index[i-1]);
+     if(fs.fsname=filesystem_fat12) then
+     fatentry.entry12:=fat12_final_cluster_low
+     else if(fs.fsname=filesystem_fat16) then
+     fatentry.entry16:=fat16_final_cluster_low
+     else if(fs.fsname=filesystem_fat32) then
+     fatentry.entry32:=fat32_final_cluster_low;
+     genfs_fat_write_entry(fs,fatentry,FATUList.index[i-2]);
+    end
+   else if(testbyte=0) and (i=1) then
+    begin
+     if(fs.fsname=filesystem_fat32) then
+      begin
+       inc(fs.fat32.fsinfo.freecount,1);
+       fs.fat32.fsinfo.nextfree:=FATUlist.index[i-1];
+      end;
+     if(fs.fsname=filesystem_fat12) then
+     fatentry.entry12:=0
+     else if(fs.fsname=filesystem_fat16) then
+     fatentry.entry16:=0
+     else if(fs.fsname=filesystem_fat32) then
+     fatentry.entry32:=0;
+     genfs_fat_write_entry(fs,fatentry,FATUList.index[i-1]);
+    end;
+  end;
+ genfs_filesystem_write_info(fs);
+end;
+{File System File Delete Operation}
+procedure genfs_filesystem_delete_file(var fs:genfs_filesystem;deldir:UnicodeString;erase:boolean=false);
+var temppath:genfs_inner_path;
+    delismask:boolean;
+    delrootdir,tempdir:UnicodeString;
+    i,j,k,dellen,templen:SizeUint;
+    PosInFile:SizeUint;
+{For FAT FileSystem Only}
+    FATUList:genfs_fat_cluster_list;
+    StartCluster:SizeUint;
+    StartPos,EndPos:genfs_fat_position_info;
+begin
+ temppath:=genfs_filesystem_search_for_path(fs,deldir);
+ delismask:=genfs_is_mask(deldir);
+ if(delismask) then
+  begin
+   delrootdir:=genfs_extract_search_path_without_wildcard(deldir); dellen:=length(delrootdir)+1;
+   StartCluster:=genfs_fat_get_file_cluster(fs,delrootdir);
+  end
+ else
+  begin
+   delrootdir:=genfs_extract_file_path(deldir); dellen:=length(delrootdir)+1;
+   StartCluster:=genfs_fat_get_file_cluster(fs,delrootdir);
+  end;
+ i:=temppath.count;
+ while(i>0)do
+  begin
+   templen:=length(temppath.FilePath[i-1]);
+   if(Copy(temppath.FilePath[i-1],templen-2,3)='/..') or
+   (Copy(temppath.FilePath[i-1],templen-2,3)='/.') or
+   (Copy(temppath.FilePath[i-1],templen-2,3)='\..') or
+   (Copy(temppath.FilePath[i-1],templen-2,3)='\.') then
+    begin
+     dec(i); continue;
+    end;
+   if(fs.fsname<=filesystem_fat32) then
+    begin
+     if((delismask) and (genfs_mask_match(deldir,temppath.FilePath[i-1])))
+     or(genfs_check_prefix(deldir,temppath.FilePath[i-1]))then
+      begin
+       StartCluster:=genfs_fat_get_file_cluster(fs,temppath.FilePath[i-1]);
+       if(StartCluster>0) then
+       FATUlist:=genfs_fat_get_using_cluster(fs,StartCluster)
+       else
+       FATUlist.count:=0;
+       if(erase) then
+        begin
+         j:=1;
+         while(j<=FATUlist.count)do
+          begin
+           genfs_fat_erase_cluster(fs,FATUlist.index[j-1]); dec(j);
+          end;
+        end;
+       tempdir:=genfs_extract_file_path(temppath.FilePath[i-1]);
+       StartPos.MainPos:=temppath.FileMainPos[i-1];
+       StartPos.SubPos:=temppath.FileSubPos[i-1];
+       if(fs.fsname=filesystem_fat32) then
+        begin
+         EndPos:=genfs_fat_location_of_file_info(fs,StartPos.MainPos,StartPos.SubPos,
+         temppath.FileStructSize[i-1]);
+         genfs_fat_move_directory(fs,tempdir,StartPos,EndPos,temppath.FileStructSize[i-1]);
+        end
        else
         begin
-         genfs_io_read(fs,sdir,fs.fat12.datastart+inlist.FileOffset[i-1],sizeof(fat_directory_structure));
-         index:=sdir.directoryfirstclusterhighword shl 16+sdir.directoryfirstclusterlowword;
-         size:=sdir.directoryfilesize;
-         templist:=genfs_filesystem_get_using_cluster(fs,index);
-         if(size=0) then
-          begin
-           genfs_external_io_write(destpath+'/'+temppath,iobyte,0,0);
-          end
-         else
-          begin
-           tempindex:=templist.index[0]; tempstorage:=0;
-           tempoffset:=0; tempcount:=size shr 9+1;
-           while(tempcount>0)do
-            begin
-             if(tempstorage+512<=Size) then
-              begin
-               genfs_io_read(fs,extcontent,fs.fat12.datastart+
-               (tempindex-2)*tempnum1*tempnum2+tempoffset,512);
-               genfs_external_io_write(destpath+'/'+temppath,extcontent,tempstorage,512);
-               inc(tempstorage,512);
-              end
-             else
-              begin
-               genfs_io_read(fs,extcontent,fs.fat12.datastart+
-               (tempindex-2)*tempnum1*tempnum2+tempoffset,size-tempstorage);
-               genfs_external_io_write(destpath+'/'+temppath,extcontent,tempstorage,size-tempstorage);
-               tempstorage:=size;
-              end;
-             inc(tempoffset,1 shl 9);
-             if(tempoffset=tempnum1*tempnum2) then
-              begin
-               tempindex:=templist.index[size shr 9+1-tempcount];
-               tempoffset:=0;
-              end;
-             dec(tempcount);
-            end;
-          end;
+         EndPos:=genfs_fat_location_of_file_info(fs,StartPos.MainPos,StartPos.SubPos,1);
+         genfs_fat_move_directory(fs,tempdir,StartPos,EndPos,1);
         end;
       end;
     end;
-  end
- else if(fs.fsname=filesystem_fat16) then
+   dec(i);
+  end;
+ genfs_filesystem_write_info(fs);
+end;
+{File System File Extract Operation}
+procedure genfs_filesystem_extract_file(fs:genfs_filesystem;indir,extdir:UnicodeString);
+var temppath:genfs_inner_path;
+    ismask:boolean;
+    rootpath,temppath2,actualpath:UnicodeString;
+    i,j,k,len,len2:SizeUint;
+    tempsize,fileptr:SizeUint;
+    BytePerSector,SectorPerCluster:SizeUint;
+    PosInFile:SizeUint;
+    content:array[1..512] of byte;
+{For FAT Only}
+    FATUList:genfs_fat_cluster_list;
+    StartCluster:SizeUint;
+begin
+ temppath:=genfs_filesystem_search_for_path(fs,indir);
+ if(fs.fsname<=filesystem_fat32) then
   begin
-   tempnum1:=fs.fat16.header.head.bpb_bytesPerSector;
-   tempnum2:=fs.fat16.header.head.bpb_SectorPerCluster;
-   for i:=1 to inlist.Count do
+   BytePerSector:=fs.fat12.header.head.bpb_bytesPerSector;
+   SectorPerCluster:=fs.fat12.header.head.bpb_SectorPerCluster;
+  end;
+ if(DirectoryExists(extdir)=false) and (FileExists(extdir)=false) then
+  begin
+   writeln('ERROR:Extract Path does not exist.');
+   readln;
+   abort;
+  end
+ else
+  begin
+   i:=1; ismask:=genfs_is_mask(indir);
+   if(ismask)then
     begin
-     if(ismask=true) and (inlist.FileClass[i-1]<>fat_directory_volume) and
-     (genfs_mask_match(srcpath,inlist.FilePath[i-1])) then
-      begin
-       exist:=true;
-       basepath:=genfs_Extract_filepath(srcpath);
-       temppath:=Copy(srcpath,length(basepath)+2,length(srcpath)-length(basepath)-1);
-       if(inlist.FileClass[i-1]=fat_directory_directory) then
-       CreateDir(destpath+'/'+temppath)
-       else
-        begin
-         genfs_io_read(fs,sdir,fs.fat16.datastart+inlist.FileOffset[i-1],sizeof(fat_directory_structure));
-         index:=sdir.directoryfirstclusterhighword shl 16+sdir.directoryfirstclusterlowword;
-         size:=sdir.directoryfilesize;
-         if(size=0) then
-          begin
-           genfs_external_io_write(destpath+'/'+temppath,iobyte,0,0);
-          end
-         else
-          begin
-           tempindex:=templist.index[0]; tempstorage:=0;
-           tempoffset:=0; tempcount:=size shr 9+1;
-           while(tempcount>0)do
-            begin
-             if(tempstorage+512<=Size) then
-              begin
-               genfs_io_read(fs,extcontent,fs.fat16.datastart+
-               (tempindex-2)*tempnum1*tempnum2+tempoffset,512);
-               genfs_external_io_write(destpath+'/'+temppath,extcontent,tempstorage,512);
-               inc(tempstorage,512);
-              end
-             else
-              begin
-               genfs_io_read(fs,extcontent,fs.fat16.datastart+
-               (tempindex-2)*tempnum1*tempnum2+tempoffset,size-tempstorage);
-               genfs_external_io_write(destpath+'/'+temppath,extcontent,tempstorage,size-tempstorage);
-               tempstorage:=size;
-              end;
-             inc(tempoffset,1 shl 9);
-             if(tempoffset=tempnum1*tempnum2) then
-              begin
-               tempindex:=templist.index[size shr 9+1-tempcount];
-               tempoffset:=0;
-              end;
-             dec(tempcount);
-            end;
-          end;
-        end;
-      end
-     else if(ismask=false) and (inlist.FileClass[i-1]<>fat_directory_volume)
-     and (genfs_check_prefix(srcpath,inlist.FilePath[i-1])) then
-      begin
-       exist:=true;
-       basepath:=genfs_extract_filepath(inlist.FilePath[i-1]);
-       temppath:=Copy(inlist.FilePath[i-1],length(basepath)+2,length(inlist.FilePath[i-1])
-       -length(basepath)-1);
-       if(inlist.FileClass[i-1]=fat_directory_directory) then
-       CreateDir(destpath+'/'+temppath)
-       else
-        begin
-         genfs_io_read(fs,sdir,fs.fat16.datastart+inlist.FileOffset[i-1],sizeof(fat_directory_structure));
-         index:=sdir.directoryfirstclusterhighword shl 16+sdir.directoryfirstclusterlowword;
-         size:=sdir.directoryfilesize;
-         templist:=genfs_filesystem_get_using_cluster(fs,index);
-         if(size=0) then
-          begin
-           genfs_external_io_write(destpath+'/'+temppath,iobyte,0,0);
-          end
-         else
-          begin
-           tempindex:=templist.index[0]; tempstorage:=0;
-           tempoffset:=0; tempcount:=size shr 9+1;
-           while(tempcount>0)do
-            begin
-             if(tempstorage+512<=Size) then
-              begin
-               genfs_io_read(fs,extcontent,fs.fat16.datastart+
-               (tempindex-2)*tempnum1*tempnum2+tempoffset,512);
-               genfs_external_io_write(destpath+'/'+temppath,extcontent,tempstorage,512);
-               inc(tempstorage,512);
-              end
-             else
-              begin
-               genfs_io_read(fs,extcontent,fs.fat16.datastart+
-               (tempindex-2)*tempnum1*tempnum2+tempoffset,size-tempstorage);
-               genfs_external_io_write(destpath+'/'+temppath,extcontent,tempstorage,size-tempstorage);
-               tempstorage:=size;
-              end;
-             inc(tempoffset,1 shl 9);
-             if(tempoffset=tempnum1*tempnum2) then
-              begin
-               tempindex:=templist.index[size shr 9+1-tempcount];
-               tempoffset:=0;
-              end;
-             dec(tempcount);
-            end;
-          end;
-        end;
-      end;
+     rootpath:=genfs_extract_search_path_without_wildcard(indir); len:=length(rootpath)+1;
+    end
+   else
+    begin
+     rootpath:=genfs_extract_file_path(indir); len:=length(rootpath)+1;
     end;
-  end
- else if(fs.fsname=filesystem_fat32) then
-  begin
-   tempnum1:=fs.fat32.header.head.bpb_bytesPerSector;
-   tempnum2:=fs.fat32.header.head.bpb_SectorPerCluster;
-   for i:=1 to inlist.Count do
+   len2:=length(extdir);
+   if(extdir[len2]<>'/') and (extdir[len2]<>'\') then temppath2:=extdir+'/' else temppath2:=extdir;
+   while(i<=temppath.Count)do
     begin
-     if(ismask) and (inlist.FileClass[i-1]<>fat_directory_volume) and
-     (genfs_mask_match(srcpath,inlist.FilePath[i-1])) then
+     actualpath:=temppath2+Copy(indir,len+1,length(temppath.FilePath[i-1])-len);
+     if(fs.fsname<=filesystem_fat32) then
       begin
-       exist:=true;
-       basepath:=genfs_Extract_filepath(srcpath);
-       temppath:=Copy(srcpath,length(basepath)+2,length(srcpath)-length(basepath)-1);
-       if(inlist.FileClass[i-1]=fat_directory_directory) then
-       CreateDir(destpath+'/'+temppath)
+       if(temppath.FileClass[i-1] and fat_directory_directory=fat_directory_directory) then
+       CreateDir(actualpath)
        else
         begin
-         genfs_io_read(fs,sdir,fs.fat32.datastart+inlist.FileOffset[i-1]
-         +inlist.FileDirSize[i-1]-sizeof(fat_directory_structure),sizeof(fat_directory_structure));
-         index:=sdir.directoryfirstclusterhighword shl 16+sdir.directoryfirstclusterlowword;
-         size:=sdir.directoryfilesize;
-         templist:=genfs_filesystem_get_using_cluster(fs,index);
-         if(size=0) then
-          begin
-           genfs_external_io_write(destpath+'/'+temppath,iobyte,0,0);
-          end
+         StartCluster:=genfs_fat_get_file_cluster(fs,temppath.FilePath[i-1]);
+         if(StartCluster>0) then
+         FATUlist:=genfs_fat_get_using_cluster(fs,startCluster)
          else
+         FATUlist.count:=0;
+         tempsize:=genfs_fat_get_file_size(fs,temppath.FilePath[i-1]);
+         fileptr:=0;
+         j:=1; k:=1;
+         while(tempsize>0)do
           begin
-           tempindex:=templist.index[0]; tempstorage:=0;
-           tempoffset:=0; tempcount:=size shr 9+1;
-           while(tempcount>0)do
+           inc(k);
+           if(k shl 9>BytePerSector*SectorPerCluster) then
             begin
-             if(tempstorage+512<=Size) then
-              begin
-               genfs_io_read(fs,extcontent,fs.fat32.datastart+
-               (tempindex-2)*tempnum1*tempnum2+tempoffset,512);
-               genfs_external_io_write(destpath+'/'+temppath,extcontent,tempstorage,512);
-               inc(tempstorage,512);
-              end
-             else
-              begin
-               genfs_io_read(fs,extcontent,fs.fat32.datastart+
-               (tempindex-2)*tempnum1*tempnum2+tempoffset,size-tempstorage);
-               genfs_external_io_write(destpath+'/'+temppath,extcontent,tempstorage,size-tempstorage);
-               tempstorage:=size;
-              end;
-             inc(tempoffset,1 shl 9);
-             if(tempoffset=tempnum1*tempnum2) then
-              begin
-               tempindex:=templist.index[size shr 9+1-tempcount];
-               tempoffset:=0;
-              end;
-             dec(tempcount);
+             inc(j); k:=1;
             end;
-          end;
-        end;
-      end
-     else if(ismask=false) and (inlist.FileClass[i-1]<>fat_directory_volume)
-     and (genfs_check_prefix(srcpath,inlist.FilePath[i-1])) then
-      begin
-       exist:=true;
-       basepath:=genfs_extract_filepath(inlist.FilePath[i-1]);
-       temppath:=Copy(inlist.FilePath[i-1],length(basepath)+2,length(inlist.FilePath[i-1])
-       -length(basepath)-1);
-       if(inlist.FileClass[i-1]=fat_directory_directory) then
-       CreateDir(destpath+'/'+temppath)
-       else
-        begin
-         genfs_io_read(fs,sdir,fs.fat32.datastart+inlist.FileOffset[i-1]
-         +inlist.FileDirSize[i-1]-sizeof(fat_directory_structure),sizeof(fat_directory_structure));
-         index:=sdir.directoryfirstclusterhighword shl 16+sdir.directoryfirstclusterlowword;
-         size:=sdir.directoryfilesize;
-         templist:=genfs_filesystem_get_using_cluster(fs,index);
-         if(size=0) then
-          begin
-           genfs_external_io_write(destpath+'/'+temppath,iobyte,0,0);
-          end
-         else
-          begin
-           tempindex:=templist.index[0]; tempstorage:=0;
-           tempoffset:=0; tempcount:=size shr 9+1;
-           while(tempcount>0)do
+           PosInFile:=genfs_fat_cluster_to_file_position(fs,FATUlist.index[j-1]);
+           if(tempsize-fileptr>=1 shl 9) then
             begin
-             if(tempstorage+512<=Size) then
-              begin
-               genfs_io_read(fs,extcontent,fs.fat32.datastart+
-               (tempindex-2)*tempnum1*tempnum2+tempoffset,512);
-               genfs_external_io_write(destpath+'/'+temppath,extcontent,tempstorage,512);
-               inc(tempstorage,512);
-              end
-             else
-              begin
-               genfs_io_read(fs,extcontent,fs.fat32.datastart+
-               (tempindex-2)*tempnum1*tempnum2+tempoffset,size-tempstorage);
-               genfs_external_io_write(destpath+'/'+temppath,extcontent,tempstorage,size-tempstorage);
-               tempstorage:=size;
-              end;
-             inc(tempoffset,1 shl 9);
-             if(tempoffset=tempnum1*tempnum2) then
-              begin
-               tempindex:=templist.index[size shr 9+1-tempcount];
-               tempoffset:=0;
-              end;
-             dec(tempcount);
+             genfs_io_read(fs,content,PosInFile+(k-1) shl 9,1 shl 9);
+             genfs_external_io_write(actualpath,content,fileptr,1 shl 9);
+            end
+           else
+            begin
+             genfs_io_read(fs,content,PosInFile+(k-1) shl 9,tempsize-fileptr);
+             genfs_external_io_write(actualpath,content,fileptr,tempsize-fileptr);
+            end;
+           if(tempsize>=1 shl 9) then
+            begin
+             dec(tempsize,1 shl 9); inc(fileptr,1 shl 9);
+            end
+           else
+            begin
+             tempsize:=0; inc(fileptr,tempsize);
             end;
           end;
         end;
       end;
+     inc(i);
+    end;
+  end;
+end;
+{File System File Get Content}
+function genfs_filesystem_get_content(fs:genfs_filesystem;reqdir:UnicodeString;
+ptr:SizeUint):genfs_content;
+var FileInPos:SizeUint;
+    SizeOfFile:SizeUint;
+{Only For FAT FileSystem}
+    FATUList:genfs_fat_cluster_list;
+    listindex,Cluster,Offset:SizeUInt;
+    FATBPS,FATSPC:SizeUint;
+begin
+ if(fs.fsname<=filesystem_fat32) then
+  begin
+   SizeOfFile:=genfs_fat_get_file_size(fs,reqdir);
+   if(SizeOfFile=0) then exit;
+   fatbps:=fs.fat12.header.head.bpb_bytesPerSector;
+   fatspc:=fs.fat12.header.head.bpb_SectorPerCluster;
+   Cluster:=genfs_fat_get_file_cluster(fs,reqdir);
+   FATUList:=genfs_fat_get_using_cluster(fs,Cluster);
+   listindex:=1; offset:=0;
+   while(listindex<=FATUlist.count)do
+    begin
+     if((listindex-1)*fatbps*fatspc shr 9+offset>=ptr) and (SizeOfFile>=1 shl 9) then
+      begin
+       FileInPos:=genfs_fat_cluster_to_file_position(fs,FATUList.index[listindex-1])+
+       (offset-1) shl 9;
+       genfs_io_read(fs,Result.content,FileInPos+(offset-1) shl 9,1 shl 9);
+       Result.size:=1 shl 9; break;
+      end
+     else if((listindex-1)*fatbps*fatspc shr 9+offset>=ptr) and (SizeOfFile<1 shl 9) then
+      begin
+       FileInPos:=genfs_fat_cluster_to_file_position(fs,FATUList.index[listindex-1])+
+       (offset-1) shl 9;
+       genfs_io_read(fs,Result.content,FileInPos+(offset-1) shl 9,SizeOfFile);
+       Result.size:=SizeOfFile; break;
+      end;
+     inc(offset);
+     if(offset>=(fatbps*fatspc) shr 9) then
+      begin
+       inc(listindex); offset:=0;
+      end;
+     dec(SizeOfFile,1 shl 9);
     end;
   end
  else
   begin
 
   end;
- if(exist=false) then
+end;
+{File System File Set Content}
+procedure genfs_filesystem_set_content(fs:genfs_filesystem;reqdir:UnicodeString;
+ptr:SizeUint;content:genfs_content);
+var FileInPos:SizeUint;
+    SizeOfFile:SizeUint;
+    FileClusterCount:SizeUint;
+    FileBlockCount:SizeUint;
+{Only for FAT FileSystem}
+    FATUList,FATAlist:genfs_fat_cluster_list;
+    listindex,Cluster,Offset:SizeUInt;
+    FATBPS,FATSPC:SizeUint;
+    FATentry:fat_entry;
+begin
+ if(fs.fsname<=filesystem_fat32) then
   begin
-   writeln('ERROR:The Extract Path does not exist in image.');
-   readln;
-   abort;
+   fatbps:=fs.fat12.header.head.bpb_bytesPerSector;
+   fatspc:=fs.fat12.header.head.bpb_SectorPerCluster;
+   SizeOfFile:=genfs_fat_get_file_size(fs,reqdir);
+   Cluster:=genfs_fat_get_file_cluster(fs,reqdir);
+   fileClusterCount:=(SizeOfFile+fatbps*fatspc-1) div (fatbps*fatspc);
+   if(SizeOfFile=0) then
+    begin
+     FATUlist.count:=0;
+     FATAlist:=genfs_fat_get_available_cluster(fs,ptr div ((fatbps*fatspc shr 9))+1);
+    end
+   else if(ptr<FileClusterCount*fatbps*fatspc shr 9) then
+    begin
+     FATUlist:=genfs_fat_get_using_cluster(fs,Cluster);
+     FATAlist.count:=0;
+    end
+   else
+    begin
+     FATUlist:=genfs_fat_get_using_cluster(fs,Cluster);
+     FATAList:=genfs_fat_get_available_cluster(fs,ptr-FileClusterCount*fatbps*fatspc shr 9+1);
+    end;
+   listindex:=1; offset:=0;
+   while(listindex<=FATUlist.count+FATAlist.count) do
+    begin
+     if(listindex=FATUList.count+FATAList.count) then
+      begin
+       if(fs.fsname=filesystem_fat12) then
+       fatentry.entry12:=fat12_final_cluster_low
+       else if(fs.fsname=filesystem_fat16) then
+       fatentry.entry16:=fat16_final_cluster_low
+       else if(fs.fsname=filesystem_fat32) then
+       fatentry.entry32:=fat32_final_cluster_low;
+       genfs_fat_write_entry(fs,fatentry,FATAList.index[FATAlist.count-1]);
+      end
+     else if(listindex>FATUlist.count) then
+      begin
+       if(fs.fsname=filesystem_fat12) then
+       fatentry.entry12:=FATAList.index[listindex-FATUlist.count]
+       else if(fs.fsname=filesystem_fat16) then
+       fatentry.entry16:=FATAList.index[listindex-FATUlist.count]
+       else if(fs.fsname=filesystem_fat32) then
+       fatentry.entry32:=FATAList.index[listindex-FATUlist.count];
+       genfs_fat_write_entry(fs,fatentry,FATAList.index[listindex-FATUlist.count-1]);
+      end
+     else if(listindex=FATUlist.count) and (FATUlist.count<>0) then
+      begin
+       if(fs.fsname=filesystem_fat12) then
+       fatentry.entry12:=FATAList.index[0]
+       else if(fs.fsname=filesystem_fat16) then
+       fatentry.entry16:=FATAList.index[0]
+       else if(fs.fsname=filesystem_fat32) then
+       fatentry.entry32:=FATAList.index[0];
+       genfs_fat_write_entry(fs,fatentry,FATUList.index[FATUlist.count-1]);
+      end;
+     if((listindex-1)*fatbps*fatspc shr 9+offset>=ptr) and (SizeOfFile>=1 shl 9) then
+      begin
+       if(listindex>FATUlist.count) then
+       FileInPos:=genfs_fat_cluster_to_file_position(fs,FATAList.index[listindex-FATUList.count-1])+
+       (offset-1) shl 9
+       else
+       FileInPos:=genfs_fat_cluster_to_file_position(fs,FATUList.index[listindex-1])+
+       (offset-1) shl 9;
+       genfs_io_write(fs,content.content,FileInPos+(offset-1) shl 9,content.size); break;
+      end
+     else if((listindex-1)*fatbps*fatspc shr 9+offset>=ptr) and (SizeOfFile<1 shl 9) then
+      begin
+       if(listindex>FATUlist.count) then
+       FileInPos:=genfs_fat_cluster_to_file_position(fs,FATAList.index[listindex-FATUList.count-1])+
+       (offset-1) shl 9
+       else
+       FileInPos:=genfs_fat_cluster_to_file_position(fs,FATUList.index[listindex-1])+
+       (offset-1) shl 9;
+       genfs_io_write(fs,content.content,FileInPos+(offset-1) shl 9,content.size); break;
+      end;
+     inc(offset);
+     if(Offset>=fatbps*fatspc shr 9) then
+      begin
+       inc(listindex); offset:=0;
+      end;
+     dec(SizeOfFile,1 shl 9);
+    end;
+  end
+ else
+  begin
+
+  end;
+end;
+{File System File Get Content from external}
+function genfs_filesystem_get_external_content(fn:UnicodeString;ptr:SizeUint):genfs_content;
+var FileSize:SizeUint;
+    FileBlockSize:SizeUint;
+begin
+ FileSize:=genfs_external_file_size(fn);
+ FileBlockSize:=(FileSize+1 shl 9-1) div (1 shl 9);
+ if(Ptr>=FileBlockSize) then
+  begin
+   Result.size:=0;
+  end
+ else if(Ptr shl 9>=FileSize) then
+  begin
+   genfs_external_io_read(fn,Result.content,ptr shl 9,FileSize-(FileBlockSize-1) shl 9);
+   Result.size:=FileSize-(FileBlockSize-1) shl 9;
+  end
+ else
+  begin
+   genfs_external_io_read(fn,Result.content,ptr shl 9,1 shl 9);
+   Result.size:=1 shl 9;
+  end;
+end;
+{File System File Set Content from external}
+procedure genfs_filesystem_set_external_content(fn:UnicodeString;ptr:SizeUint;content:genfs_content);
+var FileSize:SizeUint;
+begin
+ genfs_external_io_write(fn,content.content,ptr shl 9,content.size);
+end;
+{File System Create the Directory missing}
+function genfs_filesystem_force_directory(var fs:genfs_filesystem;dir:UnicodeString):SizeUint;
+var pathstr:genfs_path_string;
+    totalpath:genfs_inner_path;
+    testpath:UnicodeString;
+    i,j,k,m,n:SizeUint;
+{For FAT Directory Create Only}
+    dircontent:array[1..32] of byte;
+    tempstr:PWideChar;
+    fatstr:fat_string;
+    fatdir:fat_directory;
+    FATentry:fat_entry;
+    HavePrevNext:boolean;
+    FATpos:genfs_fat_position_info;
+    FATAlist,FATUlist:genfs_fat_cluster_list;
+    PrevCluster,CurCluster:SizeUint;
+    PosInFile:SizeUint;
+begin
+ totalpath:=genfs_filesystem_search_for_path(fs,dir);
+ pathstr:=genfs_path_to_path_string(dir);
+ testpath:='/';
+ if(fs.fsname<=filesystem_fat32) then
+  begin
+   i:=1;
+   if(fs.fsname=filesystem_fat12) then CurCluster:=2
+   else if(fs.fsname=filesystem_fat16) then CurCluster:=2
+   else if(fs.fsname=filesystem_fat32) then CurCluster:=fs.fat32.header.exthead.bpb_rootcluster;
+   PrevCluster:=CurCluster;
+   while(i<=pathstr.count)do
+    begin
+     j:=1; HavePrevNext:=false;
+     while(j<=totalpath.count)do
+      begin
+       if((j>1) and (testpath+'/'+pathstr.path[i-1]=totalpath.FilePath[j-1]))
+       or((j=1) and (testpath+pathstr.path[i-1]=totalpath.FilePath[j-1])) then
+        begin
+         if(fs.fsname<=filesystem_fat16) then
+         fatpos:=genfs_fat_location_of_file_info(fs,totalpath.FileMainPos[j-1],
+         totalpath.FileSubPos[j-1],1)
+         else
+         fatpos:=genfs_fat_location_of_file_info(fs,totalpath.FileMainPos[j-1],
+         totalpath.FileSubPos[j-1],totalpath.FileStructSize[j-1]);
+         PosInFile:=genfs_fat_cluster_to_file_position(fs,fatpos.MainPos)+
+         (fatpos.SubPos-1)*sizeof(fat_directory_structure);
+         genfs_io_read(fs,dircontent,PosInFile,sizeof(fat_directory_structure));
+         if(fs.fsname<=filesystem_fat32) and
+         (fat_get_file_class(Pfat_directory_structure(@dircontent)^.directoryattribute,
+         totalpath.FileStructSize[j-1]>1) and fat_directory_directory=fat_directory_directory) then
+          begin
+           CurCluster:=Pfat_directory_structure(@dircontent)^.directoryfirstclusterhighword shl 16
+           +Pfat_directory_structure(@dircontent)^.directoryfirstclusterlowword;
+          end
+         else if(fs.fsname<=filesystem_fat16) and
+         (fat_get_file_class(Pfat_directory_structure(@dircontent)^.directoryattribute,false)
+         and fat_directory_directory=fat_directory_directory) then
+          begin
+           CurCluster:=Pfat_directory_structure(@dircontent)^.directoryfirstclusterhighword shl 16
+           +Pfat_directory_structure(@dircontent)^.directoryfirstclusterlowword;
+          end;
+         break;
+        end
+       else if(genfs_check_prefix(testpath,totalpath.FilePath[j-1],true)) then
+        begin
+         if(j>1) then HavePrevNext:=true;
+         if(fs.fsname<=filesystem_fat16) then
+         fatpos:=genfs_fat_location_of_file_info(fs,totalpath.FileMainPos[j-1],
+         totalpath.FileSubPos[j-1],1)
+         else if(fs.fsname<=filesystem_fat32) then
+         fatpos:=genfs_fat_location_of_file_info(fs,totalpath.FileMainPos[j-1],
+         totalpath.FileSubPos[j-1],totalpath.FileStructSize[j-1]);
+        end;
+       inc(j);
+      end;
+     if(j<=totalpath.count) then
+      begin
+       if(testpath='/') or (testpath='\') then
+       testpath:=testpath+pathstr.path[j-1] else testpath:=testpath+'/'+pathstr.path[j-1];
+       PrevCluster:=CurCluster;
+       inc(j); continue;
+      end
+     else
+      begin
+      end;
+     inc(i);
+    end;
+  end
+ else
+  begin
+
+  end;
+end;
+{File System File Move}
+procedure genfs_filesystem_move(fs:genfs_filesystem;srcdir,destdir:UnicodeString);
+begin
+end;
+{File System File Move to external}
+procedure genfs_filesystem_move_to_external(fs:genfs_filesystem;srcdir,destdir:UnicodeString);
+begin
+end;
+{File System File Move from external}
+procedure genfs_filesystem_move_from_external(fs:genfs_filesystem;srcdir,destdir:UnicodeString);
+begin
+end;
+{File System File Replace}
+procedure genfs_filesystem_replace(fs:genfs_filesystem;srcdir,repdir:UnicodeString);
+begin
+end;
+{File System File Replace to external}
+procedure genfs_filesystem_replace_to_external(fs:genfs_filesystem;srcdir,repdir:UnicodeString);
+begin
+end;
+{File System File Replace from external}
+procedure genfs_filesystem_replace_from_external(fs:genfs_filesystem;srcdir,repdir:UnicodeString);
+begin
+end;
+{File System File Copy between two image files}
+procedure genfs_filesystem_copy(fs1,fs2:genfs_filesystem;srcdir,destdir:UnicodeString);
+begin
+end;
+{File System File Replace between two image files}
+procedure genfs_filesystem_replace(fs1,fs2:genfs_filesystem;srcdir,destdir:UnicodeString);
+begin
+end;
+{File System File Compare between two image files}
+procedure genfs_filesystem_compare(fs1,fs2:genfs_filesystem;srcdir,destdir:UnicodeString);
+begin
+end;
+{File System File Move between two image files}
+procedure genfs_filesystem_move(fs1,fs2:genfs_filesystem;srcdir,destdir:UnicodeString);
+begin
+end;
+{File System Image Compare}
+function genfs_filesystem_compare(fs1,fs2:genfs_filesystem):boolean;
+begin
+ if(fs1.fsname<>fs2.fsname) then
+  begin
+   exit(false);
   end;
 end;
 

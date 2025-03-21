@@ -2,7 +2,7 @@ unit fsbase;
 
 interface
 
-{$MODE FPC}
+{$mode FPC}
 
 type fat_bpb_header=packed record
                     bpb_jumpboot:array[1..3] of byte;
@@ -64,6 +64,12 @@ type fat_bpb_header=packed record
     fat12_entry=0..$FFF;
     fat16_entry=0..$FFFF;
     fat32_entry=0..$FFFFFFFF;
+    fat_entry=packed record
+              case Byte of
+              0:(entry12:fat12_entry;);
+              1:(entry16:fat16_entry;);
+              2:(entry32:fat32_entry;);
+              end;
     fat12_entry_pair=bitpacked record
                      entry1:0..$FFF;
                      entry2:0..$FFF;
@@ -160,7 +166,7 @@ type fat_bpb_header=packed record
                     end;
 
 const fat_bpb_jumpboot:array[1..3] of byte=($EB,$58,$90);
-      fat_bpb_oemname:array[1..8] of char=('f','s','g','e','n',' ',' ',' ');
+      fat_bpb_oemname:array[1..8] of char=('f','s','g','e','n','f','a','t');
       fat_bpb_media:array[1..9] of byte=($F0,$F8,$F9,$FA,$FB,$FC,$FD,$FE,$FF);
       fat_default_label_name:array[1..11] of char=('V','A','I','L','D','V','O','L','U','M','E');
       fat12_default_name:array[1..8] of char=('F','A','T','1','2',' ',' ',' ');
@@ -180,8 +186,8 @@ const fat_bpb_jumpboot:array[1..3] of byte=($EB,$58,$90);
       fat_attribute_long_name:byte=$0F;
       fat_attribute_long_name_mask:byte=$3F;
       fat_attribute_last_long_entry=$40;
-      fat16_clean_bit_mask:word=$0800;
-      fat16_no_disk_io_error:word=$0400;
+      fat16_clean_bit_mask:word=$8000;
+      fat16_no_disk_io_error:word=$4000;
       fat32_clean_bit_mask:dword=$08000000;
       fat32_no_disk_io_error:dword=$04000000;
       fat12_cluster_broken:fat12_entry=$FF7;
@@ -193,9 +199,10 @@ const fat_bpb_jumpboot:array[1..3] of byte=($EB,$58,$90);
       fat12_final_cluster_high:fat12_entry=$FFF;
       fat16_final_cluster_high:fat16_entry=$FFFF;
       fat32_final_cluster_high:fat32_entry=$0FFFFFFF;
-      fat_directory_file=$00;
-      fat_directory_volume=$01;
-      fat_directory_directory=$02;
+      fat_directory_file=$01;
+      fat_directory_volume=$02;
+      fat_directory_directory=$04;
+      fat_directory_long=$08;
       fat_bit12=12;
       fat_bit16=16;
       fat_bit32=32;
@@ -235,7 +242,7 @@ procedure fat_MovefatStringToLongDirStruct(const Source:fat_String;const index:S
 var Dest:fat_long_directory_structure);
 function fat_FatStringToFatDirectory(const Source:fat_string;FileAttr:byte;
 date:fat_date;time:fat_time;FileSize:SizeUint;ClusterPos:dword):fat_directory;
-function fat_is_file(attr:byte):byte;
+function fat_get_file_class(attr:byte;islong:boolean):byte;
 function fat_calculate_directory_size(const str:PWideChar):SizeUint;
 function fat_PWideCharIsLongFileName(const str:PWideChar):boolean;
 
@@ -382,7 +389,7 @@ var bool:boolean;
 begin
  bool:=fat_PWideCharIsLongFileName(str); i:=1;
  while((str+i)^<>#0) do inc(i);
- if(bool) then fat_calculate_directory_size:=(i div 11+2)*sizeof(fat_long_directory_structure)
+ if(bool) then fat_calculate_directory_size:=(i div 13+2)*sizeof(fat_long_directory_structure)
  else fat_calculate_directory_size:=sizeof(fat_directory_structure);
 end;
 function fat_PWideCharToFatString(const str:PWideChar):fat_string;
@@ -447,7 +454,12 @@ begin
    i:=1; j:=1;
    while(j<=6)do
     begin
-     if((str+i-1)^>#127) then
+     if((str+i-1)^=#$E5) then
+      begin
+       Result.ansifn[j]:=#$5;
+       inc(i); inc(j);
+      end
+     else if((str+i-1)^>#127) then
       begin
        Result.ansifn[j]:='_';
        inc(i); inc(j);
@@ -612,7 +624,13 @@ begin
   begin
    for i:=1 to 8 do
     begin
-     if(str.ansifn[i]<=' ') then break
+     if(str.ansifn[i]<=' ') and (str.ansifn[i]<>#$5) then break
+     else if(str.ansifn[i]=#$5) then
+      begin
+       inc(len);
+       ReallocMem(Result,sizeof(WideChar)*(len+1));
+       (Result+len-1)^:=#$E5;
+      end
      else
       begin
        inc(len);
@@ -685,17 +703,17 @@ begin
  res.dir.directorywritetime:=time;
  res.dir.directoryfirstclusterhighword:=ClusterPos shr 16;
  res.dir.directoryfirstclusterlowword:=ClusterPos shl 16 shr 16;
- if(FileAttr=fat_directory_file) then
+ if(FileAttr and fat_directory_file=fat_directory_file) then
   begin
    res.dir.directoryattribute:=fat_attribute_archive;
    res.dir.directoryfilesize:=FileSize;
   end
- else if(FileAttr=fat_directory_directory) then
+ else if(FileAttr and fat_directory_directory=fat_directory_directory) then
   begin
    res.dir.directoryattribute:=fat_attribute_directory;
    res.dir.directoryfilesize:=0;
   end
- else if(FileAttr=fat_directory_volume) then
+ else if(FileAttr and fat_directory_volume=fat_directory_volume) then
   begin
    res.dir.directoryattribute:=fat_attribute_volume_id;
    res.dir.directoryfilesize:=0;
@@ -723,14 +741,26 @@ begin
   end;
  fat_FatStringToFatDirectory:=res;
 end;
-function fat_is_file(attr:byte):byte;
+function fat_get_file_class(attr:byte;islong:boolean):byte;
 begin
- if(attr and fat_attribute_directory=fat_attribute_directory) then
- fat_is_file:=fat_directory_directory
- else if(attr and fat_attribute_volume_id=fat_attribute_volume_id) then
- fat_is_file:=fat_directory_volume
+ if(islong) then
+  begin
+   if(attr and fat_attribute_directory=fat_attribute_directory) then
+   fat_get_file_class:=fat_directory_directory or fat_directory_long
+   else if(attr and fat_attribute_volume_id=fat_attribute_volume_id) then
+   fat_get_file_class:=fat_directory_volume or fat_directory_long
+   else
+   fat_get_file_class:=fat_directory_file or fat_directory_long;
+  end
  else
- fat_is_file:=fat_directory_file;
+  begin
+   if(attr and fat_attribute_directory=fat_attribute_directory) then
+   fat_get_file_class:=fat_directory_directory
+   else if(attr and fat_attribute_volume_id=fat_attribute_volume_id) then
+   fat_get_file_class:=fat_directory_volume
+   else
+   fat_get_file_class:=fat_directory_file;
+  end;
 end;
 
 end.
