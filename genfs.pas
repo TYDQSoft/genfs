@@ -1,206 +1,190 @@
-program genfs;
-
-uses genfsbase,fsbase,sysutils,classes, unit1;
-
-{$mode ObjFPC}
-
-function StrToInt(str:UnicodeString):SizeInt;
-var i,len:SizeUint;
-begin
- Result:=0; len:=length(str);
- if(length(str)=0) then exit(Result)
- else
-  begin
-   if(str[1]='-') then
-    begin
-     i:=2;
-     while(i<=len)do
-      begin
-       Result:=Result*10+Word(str[i])-Word('0');
-       inc(i);
-      end;
-     Result:=-Result;
-    end
-   else
-    begin
-     i:=1;
-     while(i<=len)do
-      begin
-       Result:=Result*10+Word(str[i])-Word('0');
-       inc(i);
-      end;
-    end;
-  end;
-end;
-function genfs_size_to_number(inputsize:UnicodeString):SizeUint;
-var i,len:SizeUint;
-    size:UnicodeString;
-begin
- size:=UpperCase(inputsize);
- len:=length(size);
- if(UpperCase(Copy(size,len-2,3))='MIB') then
-  begin
-   Result:=StrToInt(Copy(size,1,len-3));
-  end
- else if(UpperCase(Copy(size,len-2,3))='GIB') then
-  begin
-   Result:=StrToInt(Copy(size,1,len-3)) shl 10;
-  end
- else if(UpperCase(Copy(size,len-2,3))='TIB') then
-  begin
-   Result:=StrToInt(Copy(size,1,len-3)) shl 20;
-  end
- else if(UpperCase(Copy(size,len-1,2))='MB') then
-  begin
-   Result:=StrToInt(Copy(size,1,len-2));
-  end
- else if(UpperCase(Copy(size,len-1,2))='GB') then
-  begin
-   Result:=StrToInt(Copy(size,1,len-2)) shl 10;
-  end
- else if(UpperCase(Copy(size,len-1,2))='TB') then
-  begin
-   Result:=StrToInt(Copy(size,1,len-2)) shl 20;
-  end
- else
-  begin
-   writeln('ERROR:Unrecognized Size Number '+size+'.');
-   readln;
-   abort;
-  end;
-end;
-procedure genfs_run_command(param:array of Unicodestring);
-var i:SizeUint;
-    fs:genfs_filesystem;
-    tempnum:SizeUint;
-begin
- if(FileExists(param[1])=false) and (Lowercase(param[0])<>'create') then
-  begin
-   writeln('ERROR:image file does not exist.');
-   readln;
-   abort;
-  end;
- if(LowerCase(param[0])='create') then
-  begin
-   if(length(param)<4) then
-    begin
-     writeln('ERROR:Too Few Arguments for create command.');
-     readln;
-     abort;
-    end;
-   tempnum:=genfs_size_to_number(param[3]);
-   if(LowerCase(param[2])='fat32') or (tempnum>2048) then
-   fs:=genfs_filesystem_create(param[1],filesystem_fat32,tempnum,
-   [Word(512),Byte(1),Word(8),Dword(tempnum shl 4),Word(6),Word(1),Word(2)])
-   else if(LowerCase(param[2])='fat16') or (tempnum>60) then
-   fs:=genfs_filesystem_create(param[1],filesystem_fat16,tempnum,
-   [Word(512),Byte(1),Word(8),Word(tempnum shl 4)])
-   else if(LowerCase(param[2])='fat12') then
-   fs:=genfs_filesystem_create(param[1],filesystem_fat12,tempnum,
-   [Word(512),Byte(1),Word(8),Word(tempnum shl 4)]);
-   genfs_filesystem_free(fs);
-  end
- else if(LowerCase(param[0])='add') then
-  begin
-   if(length(param)<4) then
-    begin
-     writeln('ERROR:Too Few Arguments for add command.');
-     readln;
-     abort;
-    end;
-   fs:=genfs_filesystem_read(param[1]);
-   genfs_filesystem_add_file(fs,param[2],param[3]);
-   genfs_filesystem_free(fs);
-  end
- else if(LowerCase(param[0])='copy') then
-  begin
-   if(length(param)<4) then
-    begin
-     writeln('ERROR:Too Few Arguments for copy command.');
-     readln;
-     abort;
-    end;
-   fs:=genfs_filesystem_read(param[1]);
-   genfs_filesystem_copy_file(fs,param[2],param[3]);
-   genfs_filesystem_free(fs);
-  end
- else if(LowerCase(param[0])='move') then
-  begin
-   writeln('Move command is not supported yet,waiting for next version.');
-   readln;
-   abort;
-  end
- else if(LowerCase(param[0])='delete') then
-  begin
-   if(length(param)<3) then
-    begin
-     writeln('ERROR:Too Few Arguments for delete command.');
-     readln;
-     abort;
-    end;
-   fs:=genfs_filesystem_read(param[1]);
-   genfs_filesystem_delete_file(fs,param[2]);
-   genfs_filesystem_free(fs);
-  end
- else if(LowerCase(param[0])='erase') then
-  begin
-   if(length(param)<3) then
-    begin
-     writeln('ERROR:Too Few Arguments for erase command.');
-     readln;
-     abort;
-    end;
-   fs:=genfs_filesystem_read(param[1]);
-   genfs_filesystem_delete_file(fs,param[2]);
-   genfs_filesystem_free(fs);
-  end
- else if(LowerCase(param[0])='replace') then
-  begin
-   writeln('Replace command is not supported yet,waiting for next version.');
-   readln;
-   abort;
-  end
- else if(LowerCase(param[0])='extract') then
-  begin
-   if(length(param)<4) then
-    begin
-     writeln('ERROR:Too Few Arguments for delete command.');
-     readln;
-     abort;
-    end;
-   fs:=genfs_filesystem_read(param[1]);
-   genfs_filesystem_extract_file(fs,param[2],param[3]);
-   genfs_filesystem_free(fs);
-  end;
-end;
-var myparam:array of Unicodestring;
-    i:SizeUint;
-begin
- if(ParamCount<3) then
-  begin
-   writeln('genfs:Too few parameter,Show the help:');
-   writeln('Template:genfs [commands] [parameters]');
-   writeln('Vaild Commands:create/add/copy/move/delete/erase/replace/extract');
-   writeln('               create [imagename] [filesystemtype] [Size in MiB]');
-   writeln('               Vaild File System Type:fat12/fat16/fat32');
-   writeln('               add [imagename] [Source File] [Destination File]');
-   writeln('               copy [imagename] [Source File In Image] [Destination File In Image]');
-   writeln('               move is not supported yet,it will appear in next version.');
-   writeln('               delete [imagename] [Delete File In Image]');
-   writeln('               erase [imagename] [Thoroughly delete File In Image]');
-   writeln('               replace is not supported yet,it will appear in next version');
-   writeln('               extract [imagename] [Source File In Image] [Destination File Outside the Image]');
-   writeln('Example:genfs create fat.img fat32 64MB');
-   readln;
-   exit;
-  end;
- SetLength(myparam,ParamCount);
- for i:=1 to ParamCount do
-  begin
-   myparam[i-1]:=StringToUnicodeString(ParamStr(i));
-  end;
- genfs_run_command(myparam);
- writeln('Command Done!');
- readln;
-end.
-
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <ProjectSession>
+    <PathDelim Value="\"/>
+    <Version Value="12"/>
+    <BuildModes Active="Default"/>
+    <Units>
+      <Unit>
+        <Filename Value="genfs.lpr"/>
+        <IsPartOfProject Value="True"/>
+        <TopLine Value="252"/>
+        <CursorPos X="28" Y="598"/>
+        <UsageCount Value="197"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="genfsbase.pas"/>
+        <IsPartOfProject Value="True"/>
+        <IsVisibleTab Value="True"/>
+        <EditorIndex Value="1"/>
+        <TopLine Value="3384"/>
+        <CursorPos X="40" Y="3398"/>
+        <UsageCount Value="197"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="fsbase.pas"/>
+        <EditorIndex Value="2"/>
+        <TopLine Value="320"/>
+        <CursorPos X="11" Y="394"/>
+        <UsageCount Value="97"/>
+        <Loaded Value="True"/>
+      </Unit>
+    </Units>
+    <JumpHistory HistoryIndex="29">
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="4379" Column="71" TopLine="4362"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="2552" Column="11" TopLine="2600"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="3927" Column="29" TopLine="3915"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="3777" Column="53" TopLine="3786"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="333" Column="24" TopLine="325"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="4870" Column="23" TopLine="4819"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="3740" Column="15" TopLine="3759"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="2745" Column="9" TopLine="2733"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="145" Column="11" TopLine="151"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="3240" Column="65" TopLine="3227"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="3"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="3785" Column="28" TopLine="3778"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="4387" Column="24" TopLine="4376"/>
+      </Position>
+      <Position>
+        <Filename Value="genfs.lpr"/>
+        <Caret Line="260" Column="25" TopLine="253"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="4990" Column="29" TopLine="4753"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="2745" Column="9" TopLine="2733"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="3243" Column="72" TopLine="3232"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="4389" Column="26" TopLine="4377"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="4992" Column="19" TopLine="4918"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="283" Column="11" TopLine="278"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="300" Column="11" TopLine="278"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="317" Column="11" TopLine="282"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="2919" Column="30" TopLine="2910"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="4911" TopLine="4980"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="3005" Column="48" TopLine="2994"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="2541" Column="42" TopLine="2537"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="2294" Column="10" TopLine="2303"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="2494" Column="11" TopLine="2522"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="1142" Column="10" TopLine="4779"/>
+      </Position>
+      <Position>
+        <Filename Value="genfsbase.pas"/>
+        <Caret Line="2542" Column="39" TopLine="2532"/>
+      </Position>
+    </JumpHistory>
+    <RunParams>
+      <FormatVersion Value="2"/>
+      <Modes ActiveMode="default">
+        <Mode Name="default">
+          <local>
+            <CommandLineParams Value="add fat.img bootx64.efi /EFI/BOOT/bootx64.efi"/>
+          </local>
+        </Mode>
+      </Modes>
+    </RunParams>
+    <HistoryLists>
+      <List Name="LaunchingApplication" Type="File" Count="1">
+        <Item1 Value="C:\WINDOWS\system32\cmd.exe /C ${TargetCmdLine}"/>
+      </List>
+      <List Name="CommandLineParameters" Count="14">
+        <Item1 Value="add fat.img bootx64.efi /EFI/BOOT/bootx64.efi"/>
+        <Item2 Value="create fat.img fat32 64MiB"/>
+        <Item3 Value="add fat.img &quot;C:\Users\Administrator\Desktop\bootx64.efi&quot; /EFI/BOOT/BOOTX64.EFI"/>
+        <Item4 Value="add fat.img &quot;C:\Users\Administrator\Desktop\bootx64.efi&quot; /BOOT/EFI/BOOTX64.EFI"/>
+        <Item5 Value="add fat.img Binaries/Kernel/*.efi /BOOT/EFI/BOOTX64.EFI"/>
+        <Item6 Value="extract &quot;C:\Users\Administrator\Desktop\FAT.IMG&quot; /EFI/BOOT/BOOTX64.EFI &quot;C:\Users\Administrator\Desktop\&quot;"/>
+        <Item7 Value="extract "/>
+        <Item8 Value="add fat.img &quot;E:\LazarusProject\genfs\genfsbase.pas&quot; /EFI/BOOT/test.pas"/>
+        <Item9 Value="add fat.img &quot;E:\LazarusProject\genfs\genfsbase.pas&quot; /test.pas"/>
+        <Item10 Value="add fat.img &quot;E:\LazarusProject\genfs\genfsbase.pas&quot; /"/>
+        <Item11 Value="add fat.img &quot;C:\Users\Administrator\Desktop\BOOTX64.EFI&quot; &quot;/EFI/BOOT/BOOTX64.EFI&quot;"/>
+        <Item12 Value="&quot;C:\Users\Administrator\Desktop\BOOTX64.EFI&quot; &quot;/EFI/BOOT/BOOTX64.EFI&quot;"/>
+        <Item13 Value="create fat.img fat32 64MB"/>
+        <Item14 Value="extract"/>
+      </List>
+      <List Name="WorkingDirectory" Type="File" Count="1"/>
+    </HistoryLists>
+  </ProjectSession>
+</CONFIG>

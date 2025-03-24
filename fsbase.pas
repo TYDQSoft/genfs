@@ -20,7 +20,7 @@ type fat_bpb_header=packed record
                     bpb_HiddenSector:dword;
                     bpb_TotalSector32:dword;
                     end;
-    fat_extended_bpb_header_for_fat12_and_fat16=packed record
+     fat_extended_bpb_header_for_fat12_and_fat16=packed record
                                                 bs_driver_number:byte;
                                                 bs_reserved1:byte;
                                                 bs_bootsig:byte;
@@ -229,7 +229,6 @@ procedure fat_default_file_system_type_move(const bit:byte;var dest);
 function fat12_check_cluster_status(const number:fat12_entry):byte;
 function fat16_check_cluster_status(const number:fat16_entry):byte;
 function fat32_check_cluster_status(const number:fat32_entry):byte;
-function fat_get_latter_four_random_char(const str:PWideChar):PWideChar;
 function fat_PWideCharToFatString(const str:PWideChar):fat_string;
 function fat_FatStringToPWideChar(const str:fat_string):PWideChar;
 procedure fat_MoveDirStructStringToFatString(const source:fat_directory_structure;
@@ -245,6 +244,9 @@ date:fat_date;time:fat_time;FileSize:SizeUint;ClusterPos:dword):fat_directory;
 function fat_get_file_class(attr:byte;islong:boolean):byte;
 function fat_calculate_directory_size(const str:PWideChar):SizeUint;
 function fat_PWideCharIsLongFileName(const str:PWideChar):boolean;
+function fat_generate_checksum(const dirstruct:fat_directory_structure):byte;
+function fat_generate_regular_short_file_name(const str:PWideChar;inputindex:byte):PChar;
+function fat_change_short_file_name(const str:PChar;var dir:fat_directory_structure):byte;
 
 implementation
 
@@ -305,10 +307,10 @@ begin
   end;
  fat_generate_checksum:=Result;
 end;
-function fat_String_Compare(const str1:PWideChar;const str2:PWideChar):boolean;
-var i:SizeUint;
+function fat_string_compare(str1:PWideChar;str2:PWideChar):boolean;
+var i,j:SizeUint;
 begin
- i:=1;
+ i:=1; j:=1;
  while((str1+i-1)^<>#0) or ((str2+i-1)^<>#0) do
   begin
    if((str1+i-1)^<>(str2+i-1)^) then exit(false);
@@ -316,40 +318,82 @@ begin
   end;
  fat_string_compare:=true;
 end;
-function fat_get_latter_four_random_char(const str:PWideChar):PWideChar;
-var i,j,len,maxstep:SizeUint;
-    Result:PWideChar;
+function fat_generate_regular_short_file_name(const str:PWideChar;inputindex:byte):PChar;
+var i,j,len:SizeUint;
+    res:PChar;
+    index:byte;
 begin
- i:=1; len:=0;
- Result:=allocmem(sizeof(WideChar)*5);
- while((str+len)^<>#0)do inc(len);
- maxstep:=(len-2) shr 2; j:=1;
- while(i<=len)do
+ index:=Byte(inputindex-Byte('0'));
+ if(index>=1) and (index<=9) then
   begin
-   if(i>=3) then
+   res:=allocmem(sizeof(char)*13); i:=1;
+   while(i<=6)do
     begin
-     Randomize;
-     if(i=3) then inc(i,Random(Sizeint(maxstep)))
-     else inc(i,1+Random(SizeInt(maxstep)));
-     if(i>len) then break;
-     (Result+j-1)^:=(str+i-1)^;
-     if(i=3) then inc(i,1+Random(Sizeint(maxstep)));
-     inc(j);
-     if(j>4) then break;
+     if((str+i-1)^>=#127) then (res+i-1)^:='_'
+     else if((str+i-1)^>='a') and ((str+i-1)^<='z') then
+     (res+i-1)^:=Char(Byte('A')+Byte((str+i-1)^)-Byte('a'));
+     inc(i);
     end;
-   inc(i);
-  end;
- if(j<=4) then
+   (res+5)^:='~'; (res+6)^:=Char(index); (res+7)^:='.';
+   i:=1;
+   while((str+i-1)^<>'.') and ((str+i-1)^<>' ')do inc(i);
+   j:=i; inc(i);
+   while(i>=j) and (i-j>=3)do
+    begin
+     if((str+i-1)^>=#127) then (res+j-i+7)^:='_'
+     else if((str+i-1)^>='a') and ((str+i-1)^<='z') then
+     (res+j-i+7)^:=Char(Byte('A')+Byte((str+i-1)^)-Byte('a'));
+     inc(i);
+    end;
+   (res+12)^:=#0;
+  end
+ else
   begin
-   while(j<=4) do
+   res:=allocmem(sizeof(char)*13); i:=1;
+   while(i<=2)do
+    begin
+     if((str+i-1)^>=#127) then (res+i-1)^:='_'
+     else if((str+i-1)^>='a') and ((str+i-1)^<='z') then
+     (res+i-1)^:=Char(Byte('A')+Byte((str+i-1)^)-Byte('a'));
+     inc(i);
+    end;
+   i:=3;
+   while(i<=6)do
     begin
      randomize;
-     (Result+j-1)^:=WideChar(Byte('A')+Random(26));
-     inc(j);
+     (str+i-1)^:=Char(33+random(94));
+     inc(i);
     end;
+   i:=1;
+   while((str+i-1)^<>'.') and ((str+i-1)^<>' ')do inc(i);
+   j:=i; inc(i);
+   while(i>=j) and (i-j>=3)do
+    begin
+     if((str+i-1)^>=#127) then (res+j-i+7)^:='_'
+     else if((str+i-1)^>='a') and ((str+i-1)^<='z') then
+     (res+j-i+7)^:=Char(Byte('A')+Byte((str+i-1)^)-Byte('a'));
+     inc(i);
+    end;
+   (res+12)^:=#0;
   end;
- (Result+4)^:=#0;
- fat_get_latter_four_random_char:=Result;
+ fat_generate_regular_short_file_name:=res;
+end;
+function fat_change_short_file_name(const str:PChar;var dir:fat_directory_structure):byte;
+var i:SizeUint;
+begin
+ i:=1;
+ while(i<=8)do
+  begin
+   dir.directoryname[i]:=(str+i-1)^;
+   inc(i);
+  end;
+ i:=10;
+ while(i<=12)do
+  begin
+   dir.directoryext[i-9]:=(str+i-1)^;
+   inc(i);
+  end;
+ fat_change_short_file_name:=fat_generate_checksum(dir);
 end;
 function fat_PWideCharIsLongFileName(const str:PWideChar):boolean;
 var i,fpos:SizeUint;
