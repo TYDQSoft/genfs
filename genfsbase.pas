@@ -2916,7 +2916,6 @@ begin
           FreeMem(fatdir.longdir); fatdir.longdir:=nil; fatdir.longdircount:=0;
          end;
         FreeMem(tempstr);
-       writeln(genfs_get_image_size(fs));
        if(j=pathstr.Count) and (extpath.IsFile[i-1]) then
         begin
          {Move the file into File System}
@@ -2994,7 +2993,6 @@ begin
           end;
         end;
       end;
-     writeln(genfs_get_image_size(fs));
      if(TotalPath='/') or (TotalPath='\') then TotalPath:=TotalPath+pathstr.path[j-1]
      else TotalPath:=TotalPath+'/'+pathstr.path[j-1];
      inc(j);
