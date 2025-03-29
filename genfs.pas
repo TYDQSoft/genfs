@@ -258,6 +258,8 @@ begin
      else
       begin
        writeln('ERROR:File System '+param[2]+' unsupported.');
+       readln;
+       abort;
       end;
      genfs_filesystem_free(fs1);
     end
@@ -278,6 +280,7 @@ begin
      fs1:=genfs_filesystem_read(param[1]);
      genfs_filesystem_add(fs1,param[2],param[3]);
      genfs_filesystem_free(fs1);
+     writeln('Command ',param[0],' successfully done!');
     end
    else if(LowerCase(param[0])='copy') then
     begin
@@ -595,8 +598,13 @@ begin
      fs1:=genfs_filesystem_read(param[1]);
      genfs_filesystem_image_replace(fs1,param[2]);
      genfs_filesystem_free(fs1);
+    end
+   else
+    begin
+     writeln('ERROR:Command ',param[0],' not found!');
+     readln;
+     abort;
     end;
-   writeln('Command ',param[0],' successfully done!');
   end;
 end;
 var myparam:array of Unicodestring;

@@ -318,7 +318,7 @@ begin
  f.Seek(offset,0);
  if(size-size shr 3 shl 3=0) then
   begin
-   for i:=1 to Size shr 2 do
+   for i:=1 to Size shr 3 do
     begin
      if(offset+(i-1) shl 3>f.Size) then
      Pqword(@dest+(i-1) shl 3)^:=0
