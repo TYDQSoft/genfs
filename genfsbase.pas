@@ -290,9 +290,21 @@ begin
  else
  f:=TFileStream.Create(UnicodeStringToString(fs.linkfilename),fmCreate);
  f.Seek(offset,0);
- for i:=1 to Size do
+ if(size-size shr 3 shl 3=0) then
   begin
-   f.Write(PByte(@Source+i-1)^,1);
+   for i:=1 to Size shr 3 do f.Write(Pqword(@Source+(i-1) shl 3)^,8);
+  end
+ else if(size-size shr 2 shl 2=0) then
+  begin
+   for i:=1 to Size shr 2 do f.Write(Pdword(@Source+(i-1) shl 2)^,4);
+  end
+ else if(size-size shr 1 shl 1=0) then
+  begin
+   for i:=1 to Size shr 1 do f.Write(Pword(@Source+(i-1) shl 1)^,2);
+  end
+ else
+  begin
+   for i:=1 to Size do f.Write(PByte(@Source+i-1)^,1);
   end;
  f.Free;
 end;
@@ -304,12 +316,45 @@ begin
  if(Size=0) then exit;
  f:=TFileStream.Create(UnicodeStringToString(fs.linkfilename),fmOpenRead);
  f.Seek(offset,0);
- for i:=1 to Size do
+ if(size-size shr 3 shl 3=0) then
   begin
-   if(offset+i-1>f.Size) then
-   PByte(@dest+i-1)^:=0
-   else
-   f.Read(PByte(@dest+i-1)^,1);
+   for i:=1 to Size shr 2 do
+    begin
+     if(offset+(i-1) shl 3>f.Size) then
+     Pqword(@dest+(i-1) shl 3)^:=0
+     else
+     f.Read(Pqword(@dest+(i-1) shl 3)^,8);
+    end;
+  end
+ else if(size-size shr 2 shl 2=0) then
+  begin
+   for i:=1 to Size shr 2 do
+    begin
+     if(offset+(i-1) shl 2>f.Size) then
+     Pdword(@dest+(i-1) shl 2)^:=0
+     else
+     f.Read(Pdword(@dest+(i-1) shl 2)^,4);
+    end;
+  end
+ else if(size-size shr 1 shl 1=0) then
+  begin
+   for i:=1 to Size shr 1 do
+    begin
+     if(offset+(i-1) shl 1>f.Size) then
+     Pword(@dest+(i-1) shl 1)^:=0
+     else
+     f.Read(Pword(@dest+(i-1) shl 1)^,2);
+    end;
+  end
+ else
+  begin
+   for i:=1 to Size do
+    begin
+     if(offset+i-1>f.Size) then
+     PByte(@dest+i-1)^:=0
+     else
+     f.Read(PByte(@dest+i-1)^,1);
+    end;
   end;
  f.free;
 end;
@@ -318,29 +363,101 @@ procedure genfs_io_move(fs:genfs_filesystem;startoffset:SizeUint;endoffset:SizeU
 var f:TFileStream;
     i:SizeUint;
     iobyte:byte=0;
+    ioword:word=0;
+    iodword:dword=0;
+    ioqword:qword=0;
 begin
  if(MoveSize=0) then exit;
  if(FileExists(fs.linkfilename)) then
  f:=TFileStream.Create(UnicodeStringToString(fs.linkfilename),fmOpenReadWrite)
  else
  f:=TFileStream.Create(UnicodeStringToString(fs.linkfilename),fmCreate);
- for i:=1 to MoveSize do
+ if(MoveSize-MoveSize shr 3 shl 3=0) then
   begin
-   if(startoffset+i-1>f.Size) then
+   for i:=1 to MoveSize shr 3 do
     begin
-     f.Seek(endoffset+i-1,0);
-     iobyte:=0;
-     f.Write(iobyte,1);
-    end
-   else
+     if(startoffset+i-1>f.Size) then
+      begin
+       f.Seek(endoffset+(i-1) shl 3,0);
+       ioqword:=0;
+       f.Write(ioqword,8);
+      end
+     else
+      begin
+       f.Seek(startoffset+(i-1) shl 3,0);
+       f.Read(ioqword,8);
+       f.Seek(endoffset+(i-1) shl 3,0);
+       f.Write(ioqword,8);
+       ioqword:=0;
+       f.Seek(startoffset+(i-1) shl 3,0);
+       f.Write(ioqword,8);
+      end;
+    end;
+  end
+ else if(MoveSize-MoveSize shr 2 shl 2=0) then
+  begin
+   for i:=1 to MoveSize shr 2 do
     begin
-     f.Seek(startoffset+i-1,0);
-     f.Read(iobyte,1);
-     f.Seek(endoffset+i-1,0);
-     f.Write(iobyte,1);
-     iobyte:=0;
-     f.Seek(startoffset+i-1,0);
-     f.Write(iobyte,1);
+     if(startoffset+i-1>f.Size) then
+      begin
+       f.Seek(endoffset+(i-1) shl 2,0);
+       iodword:=0;
+       f.Write(iodword,4);
+      end
+     else
+      begin
+       f.Seek(startoffset+(i-1) shl 2,0);
+       f.Read(iodword,4);
+       f.Seek(endoffset+(i-1) shl 2,0);
+       f.Write(iodword,4);
+       iodword:=0;
+       f.Seek(startoffset+(i-1) shl 2,0);
+       f.Write(iodword,4);
+      end;
+    end;
+  end
+ else if(MoveSize-MoveSize shr 1 shl 1=0) then
+  begin
+   for i:=1 to MoveSize shr 1 do
+    begin
+     if(startoffset+i-1>f.Size) then
+      begin
+       f.Seek(endoffset+(i-1) shl 1,0);
+       ioword:=0;
+       f.Write(ioword,2);
+      end
+     else
+      begin
+       f.Seek(startoffset+(i-1) shl 1,0);
+       f.Read(ioword,2);
+       f.Seek(endoffset+(i-1) shl 1,0);
+       f.Write(ioword,2);
+       ioword:=0;
+       f.Seek(startoffset+(i-1) shl 1,0);
+       f.Write(ioword,2);
+      end;
+    end;
+  end
+ else
+  begin
+   for i:=1 to MoveSize do
+    begin
+     if(startoffset+i-1>f.Size) then
+      begin
+       f.Seek(endoffset+i-1,0);
+       iobyte:=0;
+       f.Write(iobyte,1);
+      end
+     else
+      begin
+       f.Seek(startoffset+i-1,0);
+       f.Read(iobyte,1);
+       f.Seek(endoffset+i-1,0);
+       f.Write(iobyte,1);
+       iobyte:=0;
+       f.Seek(startoffset+i-1,0);
+       f.Write(iobyte,1);
+      end;
     end;
   end;
  f.free;
@@ -353,9 +470,21 @@ begin
  if(Size=0) then exit;
  f:=TFileStream.Create(UnicodeStringToString(fn),fmOpenRead);
  f.Seek(offset,0);
- for i:=1 to Size do
+ if(size-size shr 3 shl 3=0) then
   begin
-   f.Read(PByte(@dest+i-1)^,1);
+   for i:=1 to Size shr 3 do f.Read(Pqword(@dest+(i-1) shl 3)^,8);
+  end
+ else if(size-size shr 2 shl 2=0) then
+  begin
+   for i:=1 to Size shr 2 do f.Read(Pdword(@dest+(i-1) shl 2)^,4);
+  end
+ else if(size-size shr 1 shl 1=0) then
+  begin
+   for i:=1 to Size shr 1 do f.Read(Pword(@dest+(i-1) shl 1)^,2);
+  end
+ else
+  begin
+   for i:=1 to Size do f.Read(Pbyte(@dest+i-1)^,1);
   end;
  f.free;
 end;
@@ -370,9 +499,21 @@ begin
  else
  f:=TFileStream.Create(UnicodeStringToString(fn),fmCreate);
  f.Seek(offset,0);
- for i:=1 to Size do
+ if(size-size shr 3 shl 3=0) then
   begin
-   f.Write(PByte(@src+i-1)^,1);
+   for i:=1 to Size shr 3 do f.Write(Pqword(@src+(i-1) shl 3)^,8);
+  end
+ else if(size-size shr 2 shl 2=0) then
+  begin
+   for i:=1 to Size shr 2 do f.Write(Pdword(@src+(i-1) shl 2)^,4);
+  end
+ else if(size-size shr 1 shl 1=0) then
+  begin
+   for i:=1 to Size shr 1 do f.Write(Pword(@src+(i-1) shl 1)^,2);
+  end
+ else
+  begin
+   for i:=1 to Size shr 1 do f.Write(Pbyte(@src+i-1)^,2);
   end;
  f.free;
 end;
@@ -951,17 +1092,46 @@ begin
   end;
  if(j>len2) then Result:=true else Result:=false;
 end;
+{File System Search Path without wildchar}
+function genfs_extract_search_path_without_wildcard(path:UnicodeString):UnicodeString;
+var i,j,len:SizeUint;
+begin
+ if(genfs_is_mask(path)) then
+  begin
+   i:=1; len:=length(path);
+   while(i<=len)do
+    begin
+     if(path[i]='*') or (path[i]='?') then break;
+     inc(i);
+    end;
+   j:=i;
+   while(j>0)do
+    begin
+     if(path[j]='/') or (path[j]='\') then break;
+     dec(j);
+    end;
+   Result:=Copy(path,1,j-1);
+  end
+ else
+  begin
+   Result:=path;
+  end;
+end;
 {External File System detection}
-function genfs_external_search_for_path(basedir:UnicodeString):genfs_path;
+function genfs_external_search_for_path(inputbasedir:UnicodeString):genfs_path;
 var SearchRec:TUnicodeSearchRec;
     Order:Longint;
     bool:boolean;
-    tempstr:UnicodeString;
+    tempstr,basedir:UnicodeString;
     temppath:genfs_path;
     i:SizeUint;
     ismask:boolean;
 begin
- ismask:=genfs_is_mask(basedir);
+ ismask:=genfs_is_mask(inputbasedir);
+ if(ismask) then
+ basedir:=genfs_extract_search_path_without_wildcard(inputbasedir)
+ else
+ basedir:=inputbasedir;
  Result.count:=0; Order:=0; bool:=false;
  if(FileExists(basedir)) then
   begin
@@ -976,12 +1146,22 @@ begin
    if(bool=false) and (ismask=false) then
    Order:=FindFirst(basedir+'/*',faDirectory,SearchRec)
    else if(bool=false) and (ismask) then
-   Order:=FindFirst(basedir,faDirectory,SearchRec)
+   Order:=FindFirst(inputbasedir,faDirectory,SearchRec)
    else Order:=FindNext(SearchRec);
    bool:=true;
-   if(DirectoryExists(basedir+'/'+SearchRec.Name)=false) then break;
+   if(basedir='\') or (basedir='/') then
+    begin
+     if(DirectoryExists(basedir+SearchRec.Name)=false) then break;
+    end
+   else
+    begin
+     if(DirectoryExists(basedir+'/'+SearchRec.Name)=false) then break;
+    end;
    if(SearchRec.Name='..') or (SearchRec.Name='.') then continue;
    if(Order<>0) then break;
+   if(basedir='\') or (basedir='/') then
+   tempstr:=BaseDir+SearchRec.Name
+   else
    tempstr:=BaseDir+'/'+SearchRec.Name;
    inc(Result.count);
    SetLength(Result.FilePath,Result.count);
@@ -1006,7 +1186,7 @@ begin
    if(bool=false) and (ismask=false) then
    Order:=FindFirst(basedir+'/*',faAnyFile,SearchRec)
    else if(bool=false) and (ismask) then
-   Order:=FindFirst(basedir,faAnyFile,SearchRec)
+   Order:=FindFirst(inputbasedir,faAnyFile,SearchRec)
    else Order:=FindNext(SearchRec);
    bool:=true;
    if(FileExists(basedir+'/'+SearchRec.Name)) then continue;
@@ -1014,7 +1194,10 @@ begin
    if(SearchRec.Attr and faDirectory=faDirectory) then continue;
    if(Order<>0) then break;
    inc(Result.count);
-   tempstr:=basedir+'/'+SearchRec.Name;
+   if(basedir='\') or (basedir='/') then
+   tempstr:=BaseDir+SearchRec.Name
+   else
+   tempstr:=BaseDir+'/'+SearchRec.Name;
    SetLength(Result.FilePath,Result.count);
    SetLength(Result.IsFile,Result.count);
    Result.FilePath[Result.count-1]:=tempstr;
@@ -1111,31 +1294,6 @@ begin
      Delete(tempstr,1,i);
     end;
    inc(i);
-  end;
-end;
-{File System Search Path without wildchar}
-function genfs_extract_search_path_without_wildcard(path:UnicodeString):UnicodeString;
-var i,j,len:SizeUint;
-begin
- if(genfs_is_mask(path)) then
-  begin
-   i:=1; len:=length(path);
-   while(i<=len)do
-    begin
-     if(path[i]='*') or (path[i]='?') then break;
-     inc(i);
-    end;
-   j:=i;
-   while(j>0)do
-    begin
-     if(path[j]='/') or (path[j]='\') then break;
-     dec(j);
-    end;
-   Result:=Copy(path,1,j-1);
-  end
- else
-  begin
-   Result:=path;
   end;
 end;
 {File System Search}

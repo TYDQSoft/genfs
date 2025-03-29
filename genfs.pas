@@ -71,7 +71,7 @@ begin
 end;
 procedure genfs_version;
 begin
- writeln('genfs(File System Generator) version Alpha 0.0.4');
+ writeln('genfs(File System Generator) version Alpha 0.0.5');
 end;
 procedure genfs_sketchy_help;
 begin
